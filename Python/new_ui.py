@@ -85,41 +85,62 @@ def write_data_to_disk():
 
 
 class SimulationThread(threading.Thread):
-    def __init__(self, rgb_label, semantic_label, instance_label, length=200, progress_bar=None):
+    def __init__(self, rgb_label, semantic_label, instance_label, length=200, progress_bar=None,
+                 output_dir="images", seed=0, finished_callback=None, error_callback=None):
         super().__init__()
         self.rgb_label = rgb_label
         self.semantic_label = semantic_label
         self.instance_label = instance_label
         self.scenario_length=length
         self.progress_bar= progress_bar
+        self.output_dir = output_dir
+        self.seed = seed
+        self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.finished_callback = finished_callback
+        self.error_callback = error_callback
+        self.scenario_path = None
 
     def run(self):
         
         try:
             # Run your CARLA simulation code here
-            run_carla_simulation(
+            result = run_carla_simulation(
                 rgb_label=self.rgb_label,
                 semantic_label=self.semantic_label,
                 instance_label=self.instance_label,
                 max_tick=self.scenario_length,
-                progress_bar = self.progress_bar
+                progress_bar=self.progress_bar,
+                output_dir=self.output_dir,
+                seed=self.seed,
+                stop_event=self.stop_event,
+                scenario_path=self.scenario_path,
+                pause_event=self.pause_event,
 
             )
+            if self.finished_callback:
+                self.finished_callback(result)
         except Exception as e:
-            # Handle any exceptions that might occur during simulation
-            print(f"Simulation thread exception: {e}")
-        finally:
-            # Code to execute after the simulation thread is terminated
-            print("Simulation thread terminated")
-            post_processing_thread = PostProcessingThread('images', 'environment_object.json')
-            post_processing_thread.start()
+            if self.error_callback:
+                self.error_callback(str(e))
+            else:
+                print(f"Simulation thread exception: {e}")
 
-            #close_carla_server()
+    def stop(self):
+        self.stop_event.set()
+        self.pause_event.clear()
+
+    def pause(self):
+        self.pause_event.set()
+
+    def resume(self):
+        self.pause_event.clear()
 class PostProcessingThread(threading.Thread):
-    def __init__(self, batch_folder, catalog_json_filename):
+    def __init__(self, batch_folder, catalog_json_filename, error_callback=None):
         super().__init__()
         self.batch_folder = batch_folder
         self.catalog_json_filename = catalog_json_filename
+        self.error_callback = error_callback
         
 
     def run(self):
@@ -128,8 +149,10 @@ class PostProcessingThread(threading.Thread):
             # Run your CARLA simulation code here
              post_process(self.batch_folder, self.catalog_json_filename)
         except Exception as e:
-            # Handle any exceptions that might occur during simulation
-            print(f"PostProcessing thread exception: {e}")
+            if self.error_callback:
+                self.error_callback(str(e))
+            else:
+                print(f"PostProcessing thread exception: {e}")
         finally:
             # Code to execute after the simulation thread is terminated
             print("PostProcessing thread terminated")
@@ -138,6 +161,9 @@ class MainWindow(QMainWindow):
     update_rgb_label = pyqtSignal(QImage)
     update_semantic_label = pyqtSignal(QImage)
     update_instance_label = pyqtSignal(QImage)
+    simulation_finished = pyqtSignal(dict)
+    simulation_failed = pyqtSignal(str)
+    postprocessing_failed = pyqtSignal(str)
     def __init__(self):
         super().__init__()
         self.data = None
@@ -210,9 +236,13 @@ class MainWindow(QMainWindow):
         self.multiple_bbox_tags_colors = []
         self.client = None
         self.world = None
+        self.simulation_thread = None
         self.init_ui()
         self.timer = QTimer()
         self.K = build_projection_matrix(self.sensor_width, self.sensor_height, 90)
+        self.simulation_finished.connect(self.on_simulation_finished)
+        self.simulation_failed.connect(self.on_simulation_failed)
+        self.postprocessing_failed.connect(self.on_postprocessing_failed)
 
         # Initialize the CARLA client and world
         # self.init_carla_client()
@@ -288,6 +318,9 @@ class MainWindow(QMainWindow):
         i = 0
         self.client = check_carla_server()
         if self.client is None:
+            if not carla_path:
+                print("CARLA is not running and CARLA_ROOT/config.ini path is not configured")
+                return
             print("Starting Carla Server")
             t = threading.Thread(target=launch_carla_server)
             t.start()
@@ -500,23 +533,40 @@ class MainWindow(QMainWindow):
         print(self.scenario_folder)
 
     def start_scenario(self):
+        if self.simulation_thread is not None and self.simulation_thread.is_alive():
+            if self.simulation_thread.pause_event.is_set():
+                self.simulation_thread.resume()
+                self.is_running = True
+                self.start_action.setEnabled(False)
+                self.pause_action.setEnabled(True)
+                self.start_action.setText('Start')
+                return
+            QMessageBox.warning(self, "Simulation already running", "Stop the current simulation before starting another.")
+            return
         self.pause_action.setEnabled(True)
         self.stop_action.setEnabled(True)
         self.start_action.setEnabled(False)
         self.folder_button.setEnabled(False)
         self.init_carla_client()
+        if self.world is None:
+            self.on_simulation_failed("Could not connect to the CARLA server.")
+            return
         self.is_running = True
         self.timer = self.startTimer(100)
         
         self.simulation_thread = SimulationThread(
-            self.label_rgb, self.label_seg, self.label_bounding, self.scenario_length, self.progress_bar
+            self.label_rgb, self.label_seg, self.label_bounding, self.scenario_length, self.progress_bar,
+            output_dir=self.scenario_folder, seed=0,
+            finished_callback=self.simulation_finished.emit,
+            error_callback=self.simulation_failed.emit,
         )
+        if self.is_corner_case:
+            scenario_file = os.path.join(os.path.dirname(__file__), f"{self.selected_example}.yaml")
+            if not os.path.isfile(scenario_file):
+                self.on_simulation_failed(f"Scenario file does not exist: {scenario_file}")
+                return
+            self.simulation_thread.scenario_path = scenario_file
         self.simulation_thread.start()
-
-        # Connect signals to slots for updating labels
-        self.update_rgb_label.connect(self.update_rgb_label_slot)
-        self.update_semantic_label.connect(self.update_semantic_label_slot)
-        self.update_instance_label.connect(self.update_instance_label_slot)
 
     def update_rgb_label_slot(self, image):
         # Update the RGB label with the provided image
@@ -553,20 +603,45 @@ class MainWindow(QMainWindow):
         self.stop_action.setEnabled(False)
         self.start_action.setEnabled(True)
         self.is_running = False
-        settings = self.world.get_settings()
-        settings.synchronous_mode = False
-        self.world.apply_settings(settings)
-        # settings=self.world.get_settings()
-        # settings.synchronous_mode = False
-        # self.world.apply_settings(settings)
-        self.killTimer(self.timer)
+        if self.simulation_thread is not None and self.simulation_thread.is_alive():
+            self.simulation_thread.stop()
+        if self.timer:
+            self.killTimer(self.timer)
         write_data_to_disk()
         self.generate_Scenario_name()
         self.start_action.setText('Start')
         self.scenario_tick = 0
-        for _, actor in self.spawned_actors:
-            actor.destroy()
+        self.spawned_actors.clear()
         self.client = None
+
+    def on_simulation_finished(self, result):
+        self.is_running = False
+        self.start_action.setEnabled(True)
+        self.stop_action.setEnabled(False)
+        self.pause_action.setEnabled(False)
+        self.folder_button.setEnabled(True)
+        self.progress_label.setText(f"Captured {len(result['captured_frames'])} synchronized frames")
+        catalog = os.path.join(os.path.dirname(__file__), 'environment_object.json')
+        self.post_processing_thread = PostProcessingThread(
+            result['output_dir'], catalog, error_callback=self.postprocessing_failed.emit)
+        self.post_processing_thread.start()
+
+    def on_simulation_failed(self, message):
+        self.is_running = False
+        self.start_action.setEnabled(True)
+        self.stop_action.setEnabled(False)
+        self.pause_action.setEnabled(False)
+        self.folder_button.setEnabled(True)
+        QMessageBox.critical(self, "CARLA simulation failed", message)
+
+    def on_postprocessing_failed(self, message):
+        QMessageBox.critical(self, "Dataset post-processing failed", message)
+
+    def closeEvent(self, event):
+        if self.simulation_thread is not None and self.simulation_thread.is_alive():
+            self.simulation_thread.stop()
+            self.simulation_thread.join(timeout=15.0)
+        event.accept()
 
     def pause_scenario(self):
         self.pause_action.setEnabled(False)
@@ -574,6 +649,8 @@ class MainWindow(QMainWindow):
         self.start_action.setEnabled(True)
         self.start_action.setText('Resume')
         self.is_running = False
+        if self.simulation_thread is not None and self.simulation_thread.is_alive():
+            self.simulation_thread.pause()
 
     def record_scenario(self):
         if self.record_action.text() == 'Record':

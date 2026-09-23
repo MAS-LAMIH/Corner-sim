@@ -1,63 +1,117 @@
-## GUI of the Virtualization Platform 
-We built the graphical interface using PyQt5, which allows the user to interact with a simulation environment created with the CARLA Python API. The interface provides various functionalities such as selecting labels for city object detection, recording the simulation, and controlling the simulation's execution (start, pause, stop).
+# CornerSim
 
-The interface displays three different images, RGB, segmented, and bounding box. The RGB image displays the simulation's environment as seen by a camera. The segmented image shows the environment with different objects separated into classes using different colors. The bounding box image shows the RGB image with bounding boxes around the selected city objects.
+CornerSim is a research prototype for creating CARLA corner-case scenarios and
+capturing RGB, semantic-segmentation, instance-segmentation, and object annotation
+data. The current GUI implements two scenario-level examples. Other taxonomy entries
+describe intended research directions and are **not yet implemented**.
 
-Additionally, the interface contains several buttons for adding, selecting, modifying, and removing events, as well as a timeline for displaying the recorded events. The user can select city object labels for detection using checkboxes provided in a group box.
+## Compatibility and installation
 
-## Requirements
+- Linux or Windows with a CARLA server compatible with 0.9.14 Python APIs
+- Python 3.10 or 3.11 for the maintained utilities (the historical GUI was developed
+  on Python 3.7, which is end-of-life and is not supported by the new package)
+- A dedicated GPU and CARLA/Unreal requirements for interactive simulation
 
--   Carla simulator (version 0.9.14 or later)
--   Python 3.x (tested on 3.7.9)
--   PyQt5
--   carla
--   keyboard
--   matplotlib
--   numpy
--   opencv-python
--   psutil
+Create an environment and install the project plus GUI dependencies:
 
+```bash
+python -m venv .venv
+source .venv/bin/activate             # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[test]'
+python -m pip install -r requirements.txt
+```
 
-## Installation
+Install CARLA itself using its official instructions. Set `path` under `[Carla]` in
+`Python/config.ini` to a local installation only if CornerSim should launch the
+server. Leaving it empty is appropriate when CARLA is launched separately. Do not
+commit a machine-specific path.
 
-1.  Install Python 3.x if it is not already installed. You can download the latest version from the official website: [https://www.python.org/downloads/](https://www.python.org/downloads/)
-    
-2.  Install CARLA simulator by following the instructions on their official website: [https://carla.readthedocs.io/en/latest/start_quickstart/](https://carla.readthedocs.io/en/latest/start_quickstart/)
+## Launching the GUI
 
-3.  Clone the repository:
+Start CARLA, then from the repository root run:
 
-`git clone https://github.com/anr-multitrans/Virtualization-Framework.git` 
+```bash
+cd Python
+python new_ui.py
+```
 
-4.  Open the terminal and navigate to the directory where you cloned the repository.
+The GUI connects to localhost port 2000, lets users select taxonomy labels and an
+implemented YAML scenario, and displays/captures synchronized sensor views. Treat
+generated output as experimental until it passes the validator below.
 
-5.  Install required packages using pip:
-    
-``pip install -r requirements.txt`` 
+## Scenario format and reproducible example
 
-   If you face problems in installing PyQt5 try installing it using apt
+Legacy examples are YAML lists. New files may use a root mapping with an integer seed:
 
-   ``sudo apt install python3-pyqt5`` 
-  
-  for other requirements please refer to their documentations.
-  Then to make sure all requirements are installed please repeate the ``pip install -r requirements.txt`` 
+```yaml
+seed: 42
+actions:
+  - type: spectator
+    location: [-53, 55, 1]
+    orientation: [0, 90, 0]
+  - type: spawn_vehicle
+    vehicle_id: ego
+    location: [20, 5, 0]
+    orientation: [0, 0, 0]
+    speed: 0.5
+```
 
-6.  Navigate using the terminal to the sub-directory "Python":
+Validate before simulation:
 
-`` cd Python ``
+```bash
+python -m cornersim.cli validate-scenario Python/Example.yaml
+```
 
-7.  Open the file 'config.ini' in any text editor, under [Carla] entry, change the value of path to the path of CARLA installation directory 
-    
-8.  Run the following command to launch the framework:
+A seed controls the new Python/NumPy utility layer. Full repeatability also requires
+synchronous CARLA stepping, a fixed delta, deterministic Traffic Manager seeds, the
+same CARLA/map/assets/GPU, and stable actor spawn order.
 
-`python new_ui.py` 
+## Dataset structure and validation
 
-Note: The script will check if CARLA simulator is running, if not it will pass a command to launch it and wait for its availability for connecting clients before launching the framework.
+The maintained validator expects matching stems:
 
-This user interface allow launching simulation scenarios and frgitering sensor data in form of (rgb, semantic_segmentation, and instance segmentation) images in addition to JSON files describing the nature of each object in ths simulation at avery tick
+```text
+dataset/
+  rgb/image_000001.png
+  semantic_segmentation/image_000001.png
+  instance_segmentation/image_000001.png
+  simulation_objects/image_000001.json
+  metadata/image_000001.json
+  labels/refined_output_000001.json
+```
 
-9. after running the simulation, if labels are not generated automatically, you may need to run the post processing script, that post-process the images and associate each of them them with a JSON file labeling the bounding boxes of every simulation object appearing in the image.
+Completion metadata is published only after all synchronized sensor files and object metadata are staged. Post-processing writes legacy-compatible label JSON containing a string `label` (or `base_label`) and `min_x`, `min_y`, `max_x`, `max_y` bounded by the image. Validate an export with:
 
-    `python new_ui.py` 
+```bash
+python -m cornersim.cli validate-dataset /path/to/dataset
+```
 
+The command exits nonzero for missing/corrupt/mismatched files or invalid boxes.
+Existing historical exports may require directory renaming; their JSON schema is not
+silently modified.
 
-In case of any issues with the installation or running the framework, refer to the documentation or raise an issue on the Github repository.
+## Tests
+
+```bash
+python -m pytest -q                 # headless unit tests
+CORNERSIM_RUN_CARLA_TESTS=1 python -m pytest -q tests/integration
+```
+
+The default suite includes a mocked run through the actual capture function, but this is not a live simulator result. CARLA tests must not be interpreted as run unless a compatible server and renderer were actually available. See [the audit progress report](docs/AUDIT_PROGRESS.md) for
+resolved findings, limitations, and prioritized next work. See
+[`install_Carla.md`](install_Carla.md) for additional simulator setup context.
+
+## Troubleshooting
+
+- **Connection refused:** launch CARLA and check ports 2000/2001 and client/server
+  version compatibility.
+- **Empty CARLA path:** launch the server manually or configure `Python/config.ini`.
+- **Spawn collision:** adjust the scenario transform; do not retry indefinitely.
+- **Missing frame:** do not pair measurements from different frames; discard/report
+  incomplete frames.
+- **Invalid dataset:** retain the run, inspect validator errors, and regenerate rather
+  than silently deleting annotations.
+
+CornerSim is not production-ready. Passing unit tests establishes utility-level
+correctness only; it does not establish simulation realism or ML performance.
