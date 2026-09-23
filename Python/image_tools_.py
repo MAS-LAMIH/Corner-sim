@@ -296,8 +296,10 @@ def draw_bounding_boxes2(image_path, bounding_boxes):
     return base_image
 
 def match(min_x1, min_y1, max_x1, max_y1, min_x2, min_y2, max_x2, max_y2, threshold=0.5):
-    
-    
+    r1_area = max(0, max_x1 - min_x1) * max(0, max_y1 - min_y1)
+    r2_area = max(0, max_x2 - min_x2) * max(0, max_y2 - min_y2)
+    if r1_area == 0 or r2_area == 0:
+        return False
     intersection_area = calculate_intersection_area(min_x1, min_y1, max_x1, max_y1, min_x2, min_y2, max_x2, max_y2)
     #(intersection_max_x - intersection_min_x) * (intersection_max_y - intersection_min_y)
     
@@ -437,7 +439,7 @@ def refine_bbs_worker(bb, sensor_info, catalog_keywords, K, world_to_camera):
             min_x= max(0,min(w,min_x))
             min_y= max(0,min(h,min_y))
             max_x= max(0,min(w,max_x))
-            max_y= max(0,min(w,max_y))
+            max_y= max(0,min(h,max_y))
             ar= (max_x-min_x)*(max_y-min_y)
             intersection_area = calculate_intersection_area(
                 min_x, min_y, max_x, max_y,
@@ -630,4 +632,3 @@ if __name__ == '__main__':
     #print(result2)
     #result_image = draw_bounding_boxes2(rgb_image_path, result2)
     #result_image.save("output_image2.png")
-
