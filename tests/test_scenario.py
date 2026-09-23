@@ -24,6 +24,11 @@ def test_duplicate_actor_ids_are_rejected():
         validate_scenario([action, action])
 
 
+def test_action_must_reference_an_actor_spawned_earlier():
+    with pytest.raises(ScenarioValidationError, match="does not reference"):
+        validate_scenario([{"type": "change_vehicle_direction", "vehicle_id": "missing", "direction": [0, 1]}])
+
+
 def test_seed_everything_is_repeatable():
     seed_everything(7)
     first = random.random(), np.random.random()

@@ -76,11 +76,12 @@ dataset/
   rgb/image_000001.png
   semantic_segmentation/image_000001.png
   instance_segmentation/image_000001.png
-  annotations/image_000001.json
+  simulation_objects/image_000001.json
+  metadata/image_000001.json
+  labels/refined_output_000001.json
 ```
 
-Each annotation JSON is a list containing a string `label` (or legacy `base_label`)
-and `min_x`, `min_y`, `max_x`, `max_y` bounded by the image. Validate an export with:
+Completion metadata is published only after all synchronized sensor files and object metadata are staged. Post-processing writes legacy-compatible label JSON containing a string `label` (or `base_label`) and `min_x`, `min_y`, `max_x`, `max_y` bounded by the image. Validate an export with:
 
 ```bash
 python -m cornersim.cli validate-dataset /path/to/dataset
@@ -97,8 +98,7 @@ python -m pytest -q                 # headless unit tests
 CORNERSIM_RUN_CARLA_TESTS=1 python -m pytest -q tests/integration
 ```
 
-CARLA tests must not be interpreted as run unless a compatible server and renderer
-were actually available. See [the audit progress report](docs/AUDIT_PROGRESS.md) for
+The default suite includes a mocked run through the actual capture function, but this is not a live simulator result. CARLA tests must not be interpreted as run unless a compatible server and renderer were actually available. See [the audit progress report](docs/AUDIT_PROGRESS.md) for
 resolved findings, limitations, and prioritized next work. See
 [`install_Carla.md`](install_Carla.md) for additional simulator setup context.
 

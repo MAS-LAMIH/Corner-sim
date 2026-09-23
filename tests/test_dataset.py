@@ -4,6 +4,7 @@ from PIL import Image
 import pytest
 
 from cornersim.dataset import atomic_write_json, validate_dataset
+from cornersim.dataset import DatasetWriteError, SampleWriter
 
 
 def make_dataset(root):
@@ -47,3 +48,26 @@ def test_atomic_json_rejects_nan_without_partial_file(tmp_path):
     with pytest.raises(ValueError):
         atomic_write_json(target, {"value": float("nan")})
     assert not target.exists()
+
+
+class FakeImage:
+    def __init__(self, frame, color):
+        self.frame, self.color = frame, color
+
+    def save_to_disk(self, path):
+        Image.new("RGB", (20, 10), self.color).save(path)
+
+
+def test_sample_writer_publishes_complete_same_frame_sample(tmp_path):
+    measurements = {name: FakeImage(7, "red") for name in SampleWriter.STREAMS}
+    SampleWriter(tmp_path).write(7, measurements, {"frame": 7})
+    assert json.loads((tmp_path / "metadata" / "image_7.json").read_text())["complete"] is True
+    for stream in SampleWriter.STREAMS:
+        assert (tmp_path / stream / "image_7.png").is_file()
+
+
+def test_sample_writer_rejects_mismatched_frame_before_completion_marker(tmp_path):
+    measurements = {name: FakeImage(8 if name == "rgb" else 7, "red") for name in SampleWriter.STREAMS}
+    with pytest.raises(DatasetWriteError, match="rgb frame 8 != 7"):
+        SampleWriter(tmp_path).write(7, measurements, {"frame": 7})
+    assert not (tmp_path / "metadata" / "image_7.json").exists()

@@ -3,6 +3,8 @@
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Iterable
+from queue import Empty
+import time
 
 
 class SynchronizationError(ValueError):
@@ -38,3 +40,27 @@ class FrameSynchronizer:
             dropped, _ = self._pending.popitem(last=False)
             self.dropped_frames.append(dropped)
         return None
+
+
+def collect_frame(sensor_queue: Any, synchronizer: FrameSynchronizer, target_frame: int,
+                  timeout: float) -> SensorFrame:
+    """Collect exactly ``target_frame`` or raise with actionable diagnostics."""
+    deadline = time.monotonic() + timeout
+    delayed: list[int] = []
+    while time.monotonic() < deadline:
+        try:
+            frame, sensor_name, measurement = sensor_queue.get(timeout=max(0.0, deadline - time.monotonic()))
+        except Empty as error:
+            break
+        if frame < target_frame:
+            delayed.append(frame)
+            continue
+        completed = synchronizer.add(frame, sensor_name, measurement)
+        if completed is not None and completed.frame == target_frame:
+            return completed
+    pending = sorted(synchronizer._pending.get(target_frame, {}))
+    missing = sorted(synchronizer.required.difference(pending))
+    details = f"missing sensors {missing} for frame {target_frame}"
+    if delayed:
+        details += f"; discarded delayed frames {sorted(set(delayed))}"
+    raise TimeoutError(details)

@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import shutil
+import uuid
 from typing import Any
 
 from PIL import Image, UnidentifiedImageError
@@ -12,6 +14,49 @@ from PIL import Image, UnidentifiedImageError
 
 class DatasetWriteError(ValueError):
     pass
+
+
+class SampleWriter:
+    """Stage a sample and publish its completion marker last.
+
+    A validator only accepts frames with a metadata marker, so interruption cannot
+    make a partially published frame appear complete.
+    """
+
+    STREAMS = ("rgb", "semantic_segmentation", "instance_segmentation")
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+        for folder in (*self.STREAMS, "simulation_objects", "metadata"):
+            (self.root / folder).mkdir(parents=True, exist_ok=True)
+
+    def write(self, frame: int, measurements: dict[str, Any], simulation_objects: dict[str, Any]) -> None:
+        if set(measurements) != set(self.STREAMS):
+            raise DatasetWriteError(f"frame {frame} has streams {sorted(measurements)}, expected {list(self.STREAMS)}")
+        stem = f"image_{frame}"
+        destinations = [self.root / stream / f"{stem}.png" for stream in self.STREAMS]
+        destinations.extend((self.root / "simulation_objects" / f"{stem}.json",
+                             self.root / "metadata" / f"{stem}.json"))
+        existing = [str(path) for path in destinations if path.exists()]
+        if existing:
+            raise FileExistsError(f"refusing to overwrite existing sample {frame}: {existing}")
+        staging = self.root / f".sample-{frame}-{uuid.uuid4().hex}"
+        staging.mkdir()
+        try:
+            for stream in self.STREAMS:
+                image = measurements[stream]
+                if getattr(image, "frame", frame) != frame:
+                    raise DatasetWriteError(f"{stream} frame {getattr(image, 'frame', None)} != {frame}")
+                image.save_to_disk(str(staging / f"{stream}.png"))
+            atomic_write_json(staging / "objects.json", simulation_objects)
+            for stream in self.STREAMS:
+                os.replace(staging / f"{stream}.png", self.root / stream / f"{stem}.png")
+            os.replace(staging / "objects.json", self.root / "simulation_objects" / f"{stem}.json")
+            atomic_write_json(self.root / "metadata" / f"{stem}.json", {
+                "frame": frame, "streams": list(self.STREAMS), "complete": True
+            })
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 @dataclass
@@ -82,19 +127,34 @@ def validate_dataset(root: str | Path) -> ValidationReport:
     report = ValidationReport()
     folders = {name: root / name for name in ("rgb", "semantic_segmentation", "instance_segmentation")}
     annotation_dir = root / "annotations"
-    for name, folder in (*folders.items(), ("annotations", annotation_dir)):
+    legacy_labels = root / "labels"
+    if not annotation_dir.is_dir() and legacy_labels.is_dir():
+        annotation_dir = legacy_labels
+    for name, folder in folders.items():
         if not folder.is_dir():
             report.errors.append(f"missing {name} directory: {folder}")
+    if not annotation_dir.is_dir():
+        report.errors.append(f"missing annotations directory: expected {root / 'annotations'} or {legacy_labels}")
     if report.errors:
         return report
     rgb_files = {path.stem: path for path in folders["rgb"].glob("*.png")}
     if not rgb_files:
         report.errors.append(f"no PNG frames found in {folders['rgb']}")
         return report
+    for stream, folder in folders.items():
+        if stream == "rgb":
+            continue
+        extra = {path.stem for path in folder.glob("*.png")} - set(rgb_files)
+        for stem in sorted(extra):
+            report.errors.append(f"{stream}: orphan frame {stem}")
+    metadata_dir = root / "metadata"
     for stem, rgb_path in sorted(rgb_files.items()):
         report.frames_checked += 1
         related = {name: folder / f"{stem}.png" for name, folder in folders.items() if name != "rgb"}
+        frame_number = stem.removeprefix("image_")
         annotation = annotation_dir / f"{stem}.json"
+        if annotation_dir == legacy_labels:
+            annotation = annotation_dir / f"refined_output_{frame_number}.json"
         for name, path in (*related.items(), ("annotation", annotation)):
             if not path.is_file():
                 report.errors.append(f"frame {stem}: missing {name} file {path}")
@@ -115,4 +175,17 @@ def validate_dataset(root: str | Path) -> ValidationReport:
             continue
         if annotation.is_file():
             _validate_annotations(annotation, *size, report)
+        if metadata_dir.is_dir():
+            metadata_path = metadata_dir / f"{stem}.json"
+            if not metadata_path.is_file():
+                report.errors.append(f"frame {stem}: missing completion metadata {metadata_path}")
+            else:
+                try:
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    if metadata.get("frame") != int(frame_number) or metadata.get("complete") is not True:
+                        report.errors.append(f"frame {stem}: invalid completion metadata")
+                    if set(metadata.get("streams", [])) != set(folders):
+                        report.errors.append(f"frame {stem}: metadata stream list is inconsistent")
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    report.errors.append(f"frame {stem}: unreadable completion metadata ({error})")
     return report

@@ -6,7 +6,7 @@ import random
 from typing import Any
 
 import numpy as np
-SUPPORTED_ACTIONS = {"spectator", "spawn_vehicle", "spawn_pedestrian", "change_direction", "pedestrian_jump"}
+SUPPORTED_ACTIONS = {"spectator", "spawn_vehicle", "spawn_pedestrian", "change_vehicle_direction", "pedestrian_jump"}
 
 
 class ScenarioValidationError(ValueError):
@@ -45,7 +45,7 @@ def validate_scenario(data: Any) -> Scenario:
         if kind in {"spectator", "spawn_vehicle", "spawn_pedestrian", "pedestrian_jump"}:
             action["location"] = _vector(action.get("location"), "location", index)
             action["orientation"] = _vector(action.get("orientation"), "orientation", index)
-        actor_field = "vehicle_id" if "vehicle" in kind or kind == "change_direction" else "pedestrian_id"
+        actor_field = "vehicle_id" if "vehicle" in kind else "pedestrian_id"
         if kind.startswith("spawn_"):
             actor_id = action.get(actor_field)
             if not isinstance(actor_id, str) or not actor_id.strip():
@@ -53,9 +53,22 @@ def validate_scenario(data: Any) -> Scenario:
             if actor_id in ids:
                 raise ScenarioValidationError(f"action {index}: duplicate actor id {actor_id!r}")
             ids.add(actor_id)
+        elif kind in {"change_vehicle_direction", "pedestrian_jump"}:
+            actor_id = action.get(actor_field)
+            if actor_id not in ids:
+                raise ScenarioValidationError(
+                    f"action {index}: {actor_field} {actor_id!r} does not reference an earlier spawn"
+                )
+        if kind == "change_vehicle_direction":
+            direction = action.get("direction")
+            if not isinstance(direction, list) or len(direction) != 2 or any(
+                    not isinstance(value, (int, float)) for value in direction):
+                raise ScenarioValidationError(f"action {index}: direction must be a two-number list")
         if "speed" in action and not isinstance(action["speed"], (int, float)):
             raise ScenarioValidationError(f"action {index}: speed must be numeric")
         actions.append(action)
+    if actions[0]["type"] != "spectator":
+        raise ScenarioValidationError("action 0: the first action must configure the spectator")
     return Scenario(tuple(actions), seed)
 
 

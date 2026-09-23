@@ -8,6 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import multiprocessing
 import os
+from cornersim.dataset import atomic_write_json
+from cornersim.geometry import build_projection_matrix as _build_projection_matrix, project_bbox, project_point
+from cornersim.annotations import annotations_from_masks
 
 def save_result_to_json(result, output_file):
     result_json = [{
@@ -19,25 +22,16 @@ def save_result_to_json(result, output_file):
         'label': label
     } for id_, min_x, min_y, max_x, max_y, label in result]
 
-    with open(output_file, 'w') as json_file:
-        json.dump(result_json, json_file, indent=4)
+    atomic_write_json(output_file, result_json, overwrite=True)
 
 def build_projection_matrix(w, h, fov):
-    focal = w / (2.0 * np.tan(fov * np.pi / 360.0))
-    K = np.identity(3)
-    K[0, 0] = K[1, 1] = focal
-    K[0, 2] = w / 2.0
-    K[1, 2] = h / 2.0
-    return K
+    return _build_projection_matrix(int(w), int(h), float(fov))
 
 def get_image_point(loc, K, w2c):
-    point = np.array([loc.x, loc.y, loc.z, 1])
-    point_camera = np.dot(w2c, point)
-    point_camera = [point_camera[1], -point_camera[2], point_camera[0]]
-    point_img = np.dot(K, point_camera)
-    point_img[0] /= point_img[2]
-    point_img[1] /= point_img[2]
-    return point_img[0:2]
+    projected = project_point((loc.x, loc.y, loc.z), K, w2c)
+    if projected is None:
+        raise ValueError("point is behind the camera or intersects the near plane")
+    return np.asarray(projected[:2])
 
 def process_instance_segmentation(image_path):
     image = Image.open(image_path)
@@ -67,73 +61,10 @@ def process_instance_segmentation(image_path):
     return bounding_boxes
 
 def process_instance_semantic_segmentation_(instance_image_path, semantic_image_path, class_mapping):
-    instance_image = Image.open(instance_image_path)
-    semantic_image = Image.open(semantic_image_path)
-
-    instance_array = np.array(instance_image)
-    semantic_array = np.array(semantic_image)[:, :, :-1]  # Remove alpha channel
-
-    unique_colors = np.unique(instance_array.reshape(-1, instance_array.shape[2]), axis=0)
-    result = []
-    id_counter =0
-
-    def process_color(color, id_counter):
-        bounding_boxes =[]
-        specific= []
-        if np.array_equal(color, [0, 0, 0]):
-            return []
-
-        color_mask = np.all(instance_array == color, axis=2)
-
-        labeled_mask = cv2.connectedComponents((color_mask * 255).astype(np.uint8))[1]
-        num_labels = labeled_mask.max()
-
-        min_x, min_y, max_x, max_y = float('inf'), float('inf'), 0, 0  # Initialize bounding box coordinates
-        region_mask = None
-        for label_id in range(1, num_labels + 1):
-            region_mask = (labeled_mask == label_id)
-
-            if region_mask.sum() < 4:  # Adjust the threshold as needed
-                continue
-
-            region_indices = np.argwhere(region_mask)
-            min_y, min_x = min(min_y, region_indices[:, 0].min()), min(min_x, region_indices[:, 1].min())
-            max_y, max_x = max(max_y, region_indices[:, 0].max()), max(max_x, region_indices[:, 1].max())
-
-        if min_x == float('inf') or min_y == float('inf') or max_x == 0 or max_y == 0:
-            return []
-
-        # Get all the pixel indices of the object mask
-        object_pixel_indices = np.transpose(np.nonzero(color_mask))
-
-        # Extract the colors of the object pixels from the semantic image
-        object_semantic_colors = semantic_array[object_pixel_indices[:, 0], object_pixel_indices[:, 1]]
-
-        # Find the most common color within the object's semantic colors
-        unique_semantic_colors, counts = np.unique(object_semantic_colors, axis=0, return_counts=True)
-        object_rgb_color = unique_semantic_colors[np.argmax(counts)]
-
-        label = next((key for key, value in class_mapping.items() if value == tuple(object_rgb_color.tolist())), "unknown")
-        if label != "unknown":
-            return [(id_counter, min_x, min_y, max_x, max_y, label)]
-        if (not (region_mask is None)) and ( label.lower()  in specific):
-            contours, _ = cv2.findContours(region_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            for contour in contours:
-                x, y, w, h = cv2.boundingRect(contour)
-                if w * h < 4:  # Adjust the threshold as needed
-                    continue
-                bounding_boxes.append((id_counter, x, y, x + w, y + h, label))
-                id_counter+=1
-
-        return bounding_boxes
-
-    with ThreadPoolExecutor() as executor:
-        id_c = id_counter + 1  # Initialize id_counter
-        results = executor.map(process_color, unique_colors, [id_c] * len(unique_colors))
-        result = [item for sublist in results for item in sublist]
-        id_counter = id_c
-    return result
+    with Image.open(instance_image_path) as instance_image, Image.open(semantic_image_path) as semantic_image:
+        instance_array = np.asarray(instance_image)[..., :3]
+        semantic_array = np.asarray(semantic_image)[..., :3]
+    return annotations_from_masks(instance_array, semantic_array, class_mapping)
 
 
 def process_instance_semantic_segmentation(instance_image_path, semantic_image_path, class_mapping):
@@ -407,11 +338,11 @@ def refine_bbs_worker(bb, sensor_info, catalog_keywords, K, world_to_camera):
 
         corners = sensor_bb['bounding_box']['vertices']
 
-        projected_corners = [get_image_point(
-            carla.Location(x=c['x'], y=c['y'], z=c['z']),
-            K,
-            world_to_camera
-        ) for c in corners]
+        projected_box = project_bbox(
+            [(c['x'], c['y'], c['z']) for c in corners], K, world_to_camera, w, h, min_area=4.0
+        )
+        if projected_box is None:
+            continue
                 
         #min_x_proj = min([p[0] for p in projected_corners])
         #min_y_proj = min([p[1] for p in projected_corners])
@@ -430,10 +361,8 @@ def refine_bbs_worker(bb, sensor_info, catalog_keywords, K, world_to_camera):
         
         #projected_corners = [get_image_point(carla.Location(x=c[0], y=c[1], z=c[2]), K, world_to_camera) for c in corners]
         #max(0,min(w,p[0]))
-        min_x = min([p[0] for p in projected_corners])
-        min_y = min([p[1] for p in projected_corners])
-        max_x = max([p[0] for p in projected_corners])
-        max_y = max([p[1] for p in projected_corners])
+        min_x, min_y = projected_box.min_x, projected_box.min_y
+        max_x, max_y = projected_box.max_x, projected_box.max_y
         if not ((max_x - min_x) >w or (max_y-min_y)>h):
 
             min_x= max(0,min(w,min_x))
@@ -499,8 +428,7 @@ def refine_bbs(sensor_info_path, bounding_boxes_path, output_path, catalog_keywo
         refine_worker = partial(refine_bbs_worker, sensor_info=sensor_info, catalog_keywords=catalog_keywords, K=K, world_to_camera=world_to_camera)
         refined_bounding_boxes = list(executor.map(refine_worker, bounding_boxes))
 
-    with open(output_path, 'w') as output_file:
-        json.dump(refined_bounding_boxes, output_file, indent=4)
+    atomic_write_json(output_path, refined_bounding_boxes, overwrite=True)
     
     return refined_bounding_boxes
 
