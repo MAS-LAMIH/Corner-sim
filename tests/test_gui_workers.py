@@ -1,10 +1,11 @@
 import sys
 import threading
+import socket
 
 from PyQt5.QtCore import QCoreApplication, QEventLoop, QTimer
 
 sys.path.insert(0, "Python")
-from gui_workers import PostProcessingWorker, SimulationWorker  # noqa: E402
+from gui_workers import PostProcessingWorker, SimulationWorker, WorkerEventBus  # noqa: E402
 
 
 def run_worker(worker, *, stop=False):
@@ -14,7 +15,8 @@ def run_worker(worker, *, stop=False):
 
     def poll():
         while not worker.event_queue.empty():
-            event_type, value = worker.event_queue.get()
+            source, event_type, value = worker.event_queue.get()
+            assert source is worker
             if event_type == "preview":
                 previews.append(value)
             elif event_type == "progress":
@@ -105,3 +107,19 @@ def test_postprocessing_worker_reports_completion_via_signal():
     assert results == [True]
     assert not errors
     assert calls == [("dataset", "catalog.json")]
+
+
+def test_worker_event_bus_wakes_without_any_qt_object_in_worker():
+    reader, writer = socket.socketpair()
+    reader.settimeout(1)
+    bus = WorkerEventBus(writer)
+    source = object()
+    thread = threading.Thread(target=bus.publish, args=(source, "progress", 25))
+    try:
+        thread.start()
+        thread.join(timeout=1)
+        assert reader.recv(1) == b"\0"
+        assert bus.queue.get() == (source, "progress", 25)
+    finally:
+        reader.close()
+        writer.close()

@@ -5,13 +5,12 @@ from PyQt5.QtWidgets import QApplication, QAction, QMainWindow, QMenu, QVBoxLayo
 from PyQt5.QtCore import QUrl
 from PyQt5.QtGui import QDesktopServices, QIcon
 from PyQt5.QtGui import QIcon, QImage, QPixmap
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import Qt, QSocketNotifier, QThread, pyqtSignal, pyqtSlot
 # from PyQt5.QtCore import AspectRatioMode
 from PyQt5 import QtGui
 import time
 import random
 import numpy as np
-import cv2
 import keyboard
 import os
 from pathlib import Path
@@ -32,7 +31,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from Synchro3 import PreviewFrame, run_carla_simulation
-from gui_workers import PostProcessingWorker, SimulationWorker, WorkerOutcome
+from gui_workers import PostProcessingWorker, SimulationWorker, WorkerEventBus, WorkerOutcome
 from tools import (
     copyImageData,
     max_projected_length,
@@ -178,27 +177,53 @@ class MainWindow(QMainWindow):
         self.simulation_runner = run_carla_simulation
         self.postprocessing_processor = None
         self.init_ui()
-        self.worker_event_timer = QTimer(self)
-        self.worker_event_timer.setInterval(30)
-        self.worker_event_timer.timeout.connect(self._drain_worker_events)
+        # A QTimer previously polled worker queues here and was the only explicit
+        # application timer on the maintained GUI path.  The Windows diagnostic
+        # identifies a cross-thread timer destruction but not the concrete
+        # QObject, so do not infer more than the evidence supports: eliminate that
+        # timer/GC boundary entirely. Workers retain only a socket and Python data;
+        # the notifier remains parented to MainWindow on the GUI thread.
+        self._event_reader, event_writer = socket.socketpair()
+        self._event_reader.setblocking(False)
+        event_writer.setblocking(False)
+        self.worker_event_bus = WorkerEventBus(event_writer)
+        self.worker_event_notifier = QSocketNotifier(
+            self._event_reader.fileno(), QSocketNotifier.Read, self)
+        self.worker_event_notifier.activated.connect(self._drain_worker_events)
+        self._event_channel_closed = False
+        self._trace_qt_object("created", self.worker_event_notifier)
         self.K = build_projection_matrix(self.sensor_width, self.sensor_height, 90)
         self.simulation_finished.connect(self._capture_succeeded)
         self.simulation_failed.connect(self._capture_failed)
         self.postprocessing_failed.connect(self.on_postprocessing_failed)
 
-        # Initialize the CARLA client and world
-        # self.init_carla_client()
+    def _assert_gui_thread(self, operation):
+        app = QApplication.instance()
+        if app is not None and QThread.currentThread() != app.thread():
+            raise RuntimeError(f"{operation} must execute on the Qt GUI thread")
 
-        # Adjust the graphics and world settings
-        # self.adjust_carla_settings()
+    def _trace_qt_object(self, action, obj):
+        """Opt-in affinity evidence for Windows diagnostics (no handler suppression)."""
+        if os.environ.get("CORNERSIM_QT_AUDIT"):
+            print(
+                f"[qt-audit] {action}: object={type(obj).__name__} "
+                f"python_thread={threading.get_ident()} "
+                f"qt_current={int(QThread.currentThreadId())} "
+                f"gui_affinity={obj.thread() is QApplication.instance().thread()}",
+                file=sys.stderr,
+                flush=True,
+            )
 
-        # Initiate bounding_box_labels
-        # self.init_bounding_box_labels()
-
-        # Set the weather parameters
-        # self.set_weather_parameters()
-        # self.K = self.build_projection_matrix(self.sensor_width, self.sesor_height, 90)
-        # self.init_carla_scenario()
+    def _close_event_channel(self):
+        self._assert_gui_thread("worker event channel shutdown")
+        if self._event_channel_closed:
+            return
+        self._event_channel_closed = True
+        self._trace_qt_object("destroying", self.worker_event_notifier)
+        self.worker_event_notifier.setEnabled(False)
+        self.worker_event_notifier.deleteLater()
+        self._event_reader.close()
+        self.worker_event_bus.wake_socket.close()
 
     def init_ui(self):
 
@@ -508,34 +533,38 @@ class MainWindow(QMainWindow):
         self.simulation_worker = SimulationWorker(
             length=self.scenario_length, output_dir=self.scenario_folder, seed=0,
             scenario_path=scenario_file, outcome=self.simulation_outcome,
-            runner=self.simulation_runner)
-        self.worker_event_timer.start()
+            runner=self.simulation_runner, event_bus=self.worker_event_bus)
         self.simulation_worker.start()
 
-    @pyqtSlot()
-    def _drain_worker_events(self):
+    def _drain_worker_events(self, _socket_descriptor=None):
         """Transfer plain worker events to GUI objects on the GUI thread."""
-        worker = self.simulation_worker
-        if worker is not None:
-            while not worker.event_queue.empty():
-                event_type, value = worker.event_queue.get()
+        self._assert_gui_thread("worker event delivery")
+        try:
+            while self._event_reader.recv(4096):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+
+        while not self.worker_event_bus.queue.empty():
+            source, event_type, value = self.worker_event_bus.queue.get()
+            if source is self.simulation_worker:
                 if event_type == "preview":
                     self.on_preview_ready(value)
                 elif event_type == "progress":
                     self.progress_bar.setValue(value)
                 elif event_type == "finished":
                     self.simulation_finished_received = True
-            if self.simulation_finished_received and not worker.is_alive():
-                self._simulation_worker_finished()
-                return
-        post_worker = self.postprocessing_worker
-        if post_worker is not None:
-            while not post_worker.event_queue.empty():
-                event_type, _ = post_worker.event_queue.get()
-                if event_type == "finished":
-                    self.postprocessing_finished_received = True
-            if self.postprocessing_finished_received and not post_worker.is_alive():
-                self._postprocessing_worker_finished()
+            elif source is self.postprocessing_worker and event_type == "finished":
+                self.postprocessing_finished_received = True
+
+        # ``finished`` is emitted only after the runner/processor and all of its
+        # cleanup have returned.  The thread may still be unwinding its final
+        # Python frame, but it no longer owns or can call any Qt object.
+        if self.simulation_finished_received and self.simulation_worker is not None:
+            self._simulation_worker_finished()
+            return
+        if self.postprocessing_finished_received and self.postprocessing_worker is not None:
+            self._postprocessing_worker_finished()
 
     @pyqtSlot(object)
     def on_preview_ready(self, frame):
@@ -598,17 +627,23 @@ class MainWindow(QMainWindow):
         self.spawned_actors.clear()
         self.generate_Scenario_name()
         if self.close_pending:
-            QTimer.singleShot(0, self.close)
-        elif self.postprocessing_worker is None:
-            self.worker_event_timer.stop()
+            self.close()
 
     def _start_postprocessing(self, output_dir):
+        self._assert_gui_thread("post-processing initialization")
+        processor = self.postprocessing_processor
+        if processor is None:
+            # OpenCV wheels can contain their own Qt backend. Import the module on
+            # the GUI thread so a background worker never initializes Qt-native
+            # process state; the worker receives only a plain Python callable.
+            from image_tools import post_process
+            processor = post_process
         self.postprocessing_outcome = WorkerOutcome()
         self.postprocessing_finished_received = False
         self.postprocessing_worker = PostProcessingWorker(
             output_dir, str(PYTHON_DIR / 'environment_object.json'),
-            outcome=self.postprocessing_outcome, processor=self.postprocessing_processor)
-        self.worker_event_timer.start()
+            outcome=self.postprocessing_outcome, processor=processor,
+            event_bus=self.worker_event_bus)
         self.postprocessing_worker.start()
 
     def _postprocessing_worker_finished(self):
@@ -619,9 +654,7 @@ class MainWindow(QMainWindow):
         if error:
             self.postprocessing_failed.emit(error)
         if self.close_pending:
-            QTimer.singleShot(0, self.close)
-        elif self.simulation_worker is None:
-            self.worker_event_timer.stop()
+            self.close()
 
     def on_simulation_failed(self, message):
         self.is_running = False
@@ -644,6 +677,7 @@ class MainWindow(QMainWindow):
             self.close_pending = True
             event.ignore()
             return
+        self._close_event_channel()
         event.accept()
 
     def pause_scenario(self):
@@ -668,6 +702,7 @@ class MainWindow(QMainWindow):
         self.CornerCaseEditor.show_cornercase_form()
 
     def init_arrays(self, instance_image, segmentation_image, rgb_image):
+        import cv2
         instance_array = np.array(instance_image.raw_data)
         instance_array = instance_array.reshape((instance_image.height, instance_image.width, 4))
         instance_array = instance_array[:, :, :3]  # Remove alpha channel 
@@ -682,13 +717,6 @@ class MainWindow(QMainWindow):
         blended_image = cv2.addWeighted(instance_array, alpha, sem_array, 1 - alpha, 0)
         return instance_array, sem_array, rgb_image_draw, alpha, blended_image
     
-    def timerEvent(self, event):
-
-        pass
-
-
-
-
 def main():
     main_window = None
     try:

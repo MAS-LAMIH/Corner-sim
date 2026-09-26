@@ -3,6 +3,8 @@
 import importlib
 import os
 import sys
+import threading
+import time
 
 import pytest
 
@@ -61,7 +63,12 @@ def test_actual_main_window_start_path_survives_completion_and_second_run(monkey
     processed = []
 
     def runner(**kwargs):
-        kwargs["progress_callback"](100)
+        # Remain active across multiple GUI wakeups. This is the controlled
+        # Windows reproducer for the original crash, rather than an immediate
+        # worker completion that never exercises normal event delivery.
+        for progress in (10, 50, 100):
+            time.sleep(0.04)
+            kwargs["progress_callback"](progress)
         return {"stopped": False, "captured_frames": [1], "output_dir": str(tmp_path)}
 
     window.simulation_runner = runner
@@ -75,6 +82,8 @@ def test_actual_main_window_start_path_survives_completion_and_second_run(monkey
         wait_until(lambda: window.simulation_worker is None and window.postprocessing_worker is None)
         assert len(processed) == 2
         assert window.progress_bar.value() == 100
+        assert window.worker_event_notifier.thread() is app.thread()
+        assert window.worker_event_bus.wake_socket.__class__.__module__ == "socket"
     finally:
         window.close()
         app.processEvents()
@@ -99,6 +108,33 @@ def test_actual_main_window_stop_path_survives_and_skips_postprocessing(monkeypa
     finally:
         window.close()
         app.processEvents()
+
+
+def test_worker_delivery_and_qt_cleanup_stay_on_gui_thread(monkeypatch, tmp_path):
+    app, window = prepare_window(monkeypatch)
+    gui_thread = app.thread()
+    delivered_on = []
+    original = window._simulation_worker_finished
+
+    def record_delivery():
+        delivered_on.append(new_ui.QThread.currentThread())
+        original()
+
+    monkeypatch.setattr(window, "_simulation_worker_finished", record_delivery)
+
+    def runner(**kwargs):
+        assert threading.current_thread().name == "CornerSimSimulation"
+        time.sleep(0.08)
+        return {"stopped": False, "captured_frames": [], "output_dir": str(tmp_path)}
+
+    window.simulation_runner = runner
+    window.postprocessing_processor = lambda *args: None
+    window.start_scenario()
+    wait_until(lambda: window.simulation_worker is None and window.postprocessing_worker is None)
+    assert delivered_on == [gui_thread]
+    window.close()
+    app.processEvents()
+    assert window._event_channel_closed
 
 
 def test_actual_main_window_failure_path_survives_and_can_run_again(monkeypatch, tmp_path):

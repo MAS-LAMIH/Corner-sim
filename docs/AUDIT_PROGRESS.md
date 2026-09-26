@@ -161,3 +161,54 @@ CornerSim is **not fully or scientifically validated**. The highest priority nex
 is two repeated short runs against the supported CARLA version with inspection of frame metadata,
 semantic colors, annotations, cleanup, and deterministic seeds, followed by grouped
 train/validation/test manifest support.
+
+## PR #5 Windows native-abort follow-up
+
+The Windows diagnostic identifies a `QObject` timer destroyed from the wrong thread,
+but its stack does **not** identify the concrete object: the Python worker happened to
+be returning from `run_carla_simulation`, while the GUI thread was in `app.exec()`.
+Accordingly, this pass does not attribute the abort to `Path.resolve` or claim a
+post-fix live result.
+
+The maintained import/execution path was traced again:
+
+| Component | Executed by `new_ui.MainWindow`? | Qt/timer finding | Change/evidence |
+| --- | --- | --- | --- |
+| `new_ui.py` | Yes | Its GUI-owned polling `QTimer` was the only explicit application timer on the live path. | Polling was replaced by a GUI-parented `QSocketNotifier` and a Python `socketpair`; GUI affinity is checked at delivery/shutdown. |
+| `gui_workers.py` | Yes | Plain `threading.Thread`, but its old queue required the GUI polling timer. | `WorkerEventBus` retains only Python data and a socket; it imports no Qt module and never receives a QObject/bound Qt method. |
+| `Synchro3.py` | Yes | No Qt imports or objects. CARLA callbacks receive only the bus-backed Python callbacks. | Static check plus capture-pipeline tests. |
+| `image_tools.py` / OpenCV | Only after successful capture | The post-processing worker previously performed the first import itself; OpenCV wheels may load a Qt backend. | The maintained GUI now resolves/imports `post_process` on the GUI thread and passes a plain callable to the worker. `tools.py` also avoids eagerly importing OpenCV. |
+| `corner_case_form.py` | Constructed by `MainWindow`; form opened on demand | Widgets and one signal, no timer; all calls originate in GUI handlers. | Static trace. |
+| `Editor_UI.py` | No | Contains legacy `QTimer`/`startTimer` code. | Confirmed not imported by `new_ui.py`; retained as an unmaintained research prototype. |
+| `bb.py` and `Python/backup/*` | No | Legacy Qt/timer code exists. | Not reachable from the maintained launcher. |
+
+The event channel is closed only by `closeEvent` after both workers have completed.
+Notifier enable/disable/destruction, previews, progress, and completion processing all
+assert the Qt application thread. Completion is published after the runner returns,
+which means CARLA actor/settings cleanup has completed before GUI state is reset.
+No `QTimer`, `startTimer`, or `QTimer.singleShot` remains in the maintained launcher.
+Set `CORNERSIM_QT_AUDIT=1` on Windows to print notifier creation/destruction thread and
+affinity evidence without installing a Qt message handler or suppressing diagnostics.
+
+Regression coverage includes the real `MainWindow.start_scenario()` path with a fake
+runner that remains alive across several event deliveries, natural completion,
+cancellation, failure, post-processing, close cleanup, and a second run. The pure
+worker tests additionally prove that wake-up uses a socket and carries no QObject.
+Those QWidget tests remain environment-gated: they require a loadable PyQt/OpenGL
+runtime. A live Windows run is still required to establish whether this removes the
+reported native abort and to identify any native timer outside application code if it
+does not.
+
+Validation for this follow-up:
+
+- `python -m pytest -q -rs`: **56 passed, 1 skipped**. The skipped module is the
+  offscreen `MainWindow` suite because this Linux image cannot load `libGL.so.1`;
+  it is not counted as a pass. Worker/event-bus and all non-widget regressions ran.
+- `python -m compileall -q cornersim Python`: passed.
+- `git diff --check`: passed.
+- A direct `carla.Client('127.0.0.1', 2000)` probe with a two-second timeout failed;
+  no server was reachable. No live capture, live cleanup, or Windows native-abort
+  validation was performed in this environment.
+- Installing the missing Linux OpenGL runtime was attempted, but configured package
+  repositories were blocked by the environment proxy. The Windows-oriented
+  `MainWindow` fake-runner suite is committed for execution on a compatible host.

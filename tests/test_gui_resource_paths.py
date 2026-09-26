@@ -29,7 +29,25 @@ def test_sensor_and_worker_modules_do_not_construct_or_update_widgets():
     worker_source = Path("Python/gui_workers.py").read_text(encoding="utf-8")
     assert "preview_callback=self.preview_ready.emit" not in worker_source
     assert "progress_callback=self.progress_changed.emit" not in worker_source
-    assert "preview_callback=partial(_enqueue_event" in worker_source
+    assert "preview_callback=partial(_publish_event" in worker_source
+    assert "PyQt5" not in worker_source
+
+
+def test_maintained_gui_path_has_no_application_timer():
+    source = Path("Python/new_ui.py").read_text(encoding="utf-8")
+    assert "QTimer(" not in source
+    assert ".startTimer(" not in source
+    assert "QTimer.singleShot" not in source
+    assert "QSocketNotifier(" in source
+
+
+def test_opencv_postprocessor_is_resolved_before_worker_start():
+    gui_source = Path("Python/new_ui.py").read_text(encoding="utf-8")
+    tools_source = Path("Python/tools.py").read_text(encoding="utf-8")
+    assert "from image_tools import post_process" in gui_source
+    assert "processor=processor" in gui_source
+    assert "import cv2\n" not in tools_source
+    assert 'importlib.import_module("cv2")' in tools_source
 
 
 def test_legacy_gui_timer_alias_was_removed():

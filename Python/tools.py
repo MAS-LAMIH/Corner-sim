@@ -10,11 +10,25 @@ import psutil
 import random
 import math
 import time
-import cv2
+import importlib
 import sys
 #from PyQt5.QtGui import QIcon, QImage, QPixmap
 from PyQt5 import QtGui
 from PyQt5.QtCore import Qt  #QTimer, QThread, pyqtSignal
+
+
+class _LazyOpenCV:
+    """Avoid initializing OpenCV's optional Qt backend during GUI module import."""
+
+    _module = None
+
+    def __getattr__(self, name):
+        if self._module is None:
+            self._module = importlib.import_module("cv2")
+        return getattr(self._module, name)
+
+
+cv2 = _LazyOpenCV()
 
 messages = []
 CLASS_MAPPING = {
