@@ -90,9 +90,9 @@ def write_data_to_disk():
 class MainWindow(QMainWindow):
     # Public compatibility signals used by integrations built against the earlier
     # GUI API. Internal workers use their own queued signals.
-    simulation_finished = pyqtSignal(object)
-    simulation_failed = pyqtSignal(object)
-    postprocessing_failed = pyqtSignal(object)
+    simulation_finished = pyqtSignal(dict)
+    simulation_failed = pyqtSignal(str)
+    postprocessing_failed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
