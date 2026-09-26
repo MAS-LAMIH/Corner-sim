@@ -163,7 +163,8 @@ def run_carla_simulation(rgb_label: Any = None, semantic_label: Any = None, inst
                          capture_interval: int = 20, client: Any = None,
                          scenario_path: str | os.PathLike[str] | None = None,
                          pause_event: threading.Event | None = None,
-                         preview_callback: Any = None, progress_callback: Any = None) -> dict[str, Any]:
+                         preview_callback: Any = None, progress_callback: Any = None,
+                         traffic_manager_port: int = 8050) -> dict[str, Any]:
     """Run one deterministic, synchronized experiment and always restore CARLA state."""
     # Widget arguments are retained for API compatibility but deliberately ignored:
     # CARLA callbacks must never touch Qt objects.
@@ -176,7 +177,10 @@ def run_carla_simulation(rgb_label: Any = None, semantic_label: Any = None, inst
     client = client or carla.Client("localhost", 2000)
     client.set_timeout(10.0)
     world = client.get_world()
-    traffic_manager = client.get_trafficmanager()
+    # Use a dedicated port instead of CARLA's commonly shared default manager. By
+    # selecting this port, CornerSim explicitly assumes exclusive ownership for the
+    # run and may safely return the manager to asynchronous mode during cleanup.
+    traffic_manager = client.get_trafficmanager(traffic_manager_port)
     if hasattr(traffic_manager, "set_random_device_seed"):
         traffic_manager.set_random_device_seed(seed)
     blueprints = world.get_blueprint_library()
@@ -192,12 +196,16 @@ def run_carla_simulation(rgb_label: Any = None, semantic_label: Any = None, inst
     writer = SampleWriter(output_dir) if register else None
     captured: list[int] = []
 
-    with CarlaRuntime(world, fps=10.0, traffic_manager=traffic_manager) as runtime:
+    # CornerSim explicitly owns this Traffic Manager for the run. The lifecycle
+    # contract leaves it asynchronous during cleanup; shared managers must not be
+    # passed with owns_traffic_manager=True.
+    with CarlaRuntime(world, fps=10.0, traffic_manager=traffic_manager,
+                      owns_traffic_manager=True) as runtime:
         ego_bp = blueprints.find("vehicle.mercedes.sprinter")
         ego_transform = carla.Transform(carla.Location(x=-110.291763, y=97.093193, z=3.002939),
                                         carla.Rotation(pitch=-8.006648, yaw=66.636604, roll=0.000058))
         ego = runtime.own(world.spawn_actor(ego_bp, ego_transform))
-        ego.set_autopilot(True)
+        ego.set_autopilot(True, traffic_manager_port)
         world.get_spectator().set_transform(ego_transform)
         sensors = []
         for name, params in sensor_params.items():

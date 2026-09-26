@@ -22,9 +22,20 @@ explicitly skips post-processing. Window closure is asynchronous: it ignores the
 close event while cleanup is running and closes after the worker finishes.
 
 `CarlaRuntime` now snapshots primitive `synchronous_mode` and
-`fixed_delta_seconds` values before mutation, restores them onto a fresh settings
-object, and requires Traffic Manager to expose its prior synchronization state. It
-reports cleanup failures even when another exception is active.
+`fixed_delta_seconds` values before mutation and restores them onto a fresh settings
+object. CARLA 0.9.16 may expose only `set_synchronous_mode`; CornerSim therefore
+mutates a Traffic Manager only under an explicit exclusive-ownership contract and
+uses dedicated port 8050 rather than CARLA's commonly shared default manager. It
+leaves that owned manager asynchronous during cleanup and does not claim to recover
+an unknowable previous manager state. Cleanup failures are reported even when another
+exception is active.
+
+The merged lifecycle work also regressed two compatibility points: public
+`MainWindow` lifecycle signals were absent, and the runtime rejected CARLA 0.9.16
+Traffic Manager bindings that expose a setter but no getter. The signals are again
+declared as `pyqtSignal(object)` and connected during initialization. Runtime tests
+now cover setter-only owned managers, non-owned managers (never mutated), enable and
+disable failures, cancellation, and fresh world-settings restoration.
 
 ## Execution path verified in this pass
 
@@ -112,9 +123,10 @@ its schema.
 
 ## Exact validation performed in this pass
 
-- `python -m pytest -q`: 45 passed, 1 skipped. The skipped test is YAML-file loading
-  because PyYAML is unavailable; validation of in-memory scenarios passed. Skips are
-  not counted as successful tests.
+- `python -m pytest -q`: 50 passed, 1 skipped. The skipped test is the offscreen
+  QWidget smoke test because this host lacks the required Qt/OpenGL runtime; scenario
+  validation and the QtCore worker tests passed. Skips are not counted as successful
+  tests.
 - `python -m compileall -q cornersim Python`: passed.
 - `git diff --check`: passed.
 - `QT_QPA_PLATFORM=offscreen python Python/new_ui.py`: could not start on this

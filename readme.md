@@ -38,8 +38,10 @@ python Python/new_ui.py
 Launching from inside `Python/` remains supported. Sensor callbacks copy preview bytes
 and deliver them through queued Qt signals; all `QImage`, `QPixmap`, progress-bar, and
 widget updates happen on the GUI thread. Stop is cooperative: controls remain in a
-stopping state until sensors/actors are cleaned up and the original CARLA world and
-Traffic Manager settings have been restored. Cancelled runs are not post-processed.
+stopping state until sensors/actors are cleaned up, the original CARLA world settings
+are restored, and CornerSim's explicitly owned Traffic Manager is returned to
+asynchronous mode. The capture runner uses dedicated port 8050 by default rather than
+CARLA's commonly shared default Traffic Manager. Cancelled runs are not post-processed.
 
 The GUI connects to localhost port 2000, lets users select taxonomy labels and an
 implemented YAML scenario, and displays/captures synchronized sensor views. Treat

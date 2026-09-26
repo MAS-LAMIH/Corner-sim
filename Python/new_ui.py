@@ -88,6 +88,12 @@ def write_data_to_disk():
     print('writing output to disk')
 
 class MainWindow(QMainWindow):
+    # Public compatibility signals used by integrations built against the earlier
+    # GUI API. Internal workers use their own queued signals.
+    simulation_finished = pyqtSignal(object)
+    simulation_failed = pyqtSignal(object)
+    postprocessing_failed = pyqtSignal(object)
+
     def __init__(self):
         super().__init__()
         self.data = None
@@ -170,8 +176,8 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self.timer = QTimer()
         self.K = build_projection_matrix(self.sensor_width, self.sensor_height, 90)
-        self.simulation_finished.connect(self.on_simulation_finished)
-        self.simulation_failed.connect(self.on_simulation_failed)
+        self.simulation_finished.connect(self._capture_succeeded)
+        self.simulation_failed.connect(self._capture_failed)
         self.postprocessing_failed.connect(self.on_postprocessing_failed)
 
         # Initialize the CARLA client and world
@@ -610,35 +616,6 @@ class MainWindow(QMainWindow):
             self.close_pending = True
             event.ignore()
             return
-        event.accept()
-
-    def on_simulation_finished(self, result):
-        self.is_running = False
-        self.start_action.setEnabled(True)
-        self.stop_action.setEnabled(False)
-        self.pause_action.setEnabled(False)
-        self.folder_button.setEnabled(True)
-        self.progress_label.setText(f"Captured {len(result['captured_frames'])} synchronized frames")
-        catalog = os.path.join(os.path.dirname(__file__), 'environment_object.json')
-        self.post_processing_thread = PostProcessingThread(
-            result['output_dir'], catalog, error_callback=self.postprocessing_failed.emit)
-        self.post_processing_thread.start()
-
-    def on_simulation_failed(self, message):
-        self.is_running = False
-        self.start_action.setEnabled(True)
-        self.stop_action.setEnabled(False)
-        self.pause_action.setEnabled(False)
-        self.folder_button.setEnabled(True)
-        QMessageBox.critical(self, "CARLA simulation failed", message)
-
-    def on_postprocessing_failed(self, message):
-        QMessageBox.critical(self, "Dataset post-processing failed", message)
-
-    def closeEvent(self, event):
-        if self.simulation_thread is not None and self.simulation_thread.is_alive():
-            self.simulation_thread.stop()
-            self.simulation_thread.join(timeout=15.0)
         event.accept()
 
     def pause_scenario(self):

@@ -59,7 +59,7 @@ class FakeActor:
     def listen(self, callback): self.callback = callback
     def stop(self): self.stopped = True
     def destroy(self): self.is_alive = False
-    def set_autopilot(self, value): pass
+    def set_autopilot(self, value, port=None): pass
     def set_transform(self, value): self.transform = value
     def get_transform(self): return self.transform
     def apply_control(self, value): pass
@@ -111,11 +111,25 @@ class FakeTrafficManager:
     def set_random_device_seed(self, seed): self.seed = seed
 
 
+class SetterOnlyTrafficManager:
+    def __init__(self):
+        self.history = []
+        self.sync = False
+
+    def set_synchronous_mode(self, value):
+        self.sync = value
+        self.history.append(value)
+
+    def set_random_device_seed(self, seed): self.seed = seed
+
+
 class FakeClient:
     def __init__(self): self.world, self.traffic = FakeWorld(), FakeTrafficManager()
     def set_timeout(self, timeout): self.timeout = timeout
     def get_world(self): return self.world
-    def get_trafficmanager(self): return self.traffic
+    def get_trafficmanager(self, port):
+        self.traffic.port = port
+        return self.traffic
 
 
 def fake_carla():
@@ -140,6 +154,7 @@ def test_actual_capture_pipeline_writes_only_complete_same_frame_samples_and_cle
         assert objects["frame"] == frame
     assert client.world.applied[-1].marker == "original"
     assert client.traffic.sync is False
+    assert client.traffic.port == 8050
     assert all(not actor.is_alive for actor in client.world.actors)
     assert all(sensor.stopped for sensor in client.world.sensors)
 
@@ -157,3 +172,17 @@ def test_actual_capture_pipeline_restores_settings_after_cancellation(tmp_path, 
     assert client.world.applied[-1].fixed_delta_seconds is None
     assert client.traffic.sync is False
     assert all(not actor.is_alive for actor in client.world.actors)
+
+
+def test_actual_pipeline_supports_carla_0916_setter_only_traffic_manager(tmp_path, monkeypatch):
+    monkeypatch.setattr(Synchro3, "carla", fake_carla())
+    client = FakeClient()
+    client.traffic = SetterOnlyTrafficManager()
+    stop_event = threading.Event()
+    stop_event.set()
+    result = Synchro3.run_carla_simulation(
+        max_tick=1, output_dir=tmp_path, client=client, stop_event=stop_event)
+    assert result["stopped"] is True
+    assert client.traffic.history == [True, False]
+    assert client.world.applied[-1].synchronous_mode is False
+    assert client.world.applied[-1].fixed_delta_seconds is None
