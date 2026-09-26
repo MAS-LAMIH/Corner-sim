@@ -32,7 +32,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from Synchro3 import PreviewFrame
-from gui_workers import PostProcessingWorker, SimulationWorker
+from gui_workers import PostProcessingWorker, SimulationWorker, WorkerOutcome
 from tools import (
     copyImageData,
     max_projected_length,
@@ -169,12 +169,14 @@ class MainWindow(QMainWindow):
         self.simulation_worker = None
         self.postprocessing_thread = None
         self.postprocessing_worker = None
+        self.simulation_outcome = None
+        self.postprocessing_outcome = None
         self.pending_result = None
         self.pending_error = None
         self.close_pending = False
         self.stop_requested = False
         self.init_ui()
-        self.timer = QTimer()
+        self.timer_id = None
         self.K = build_projection_matrix(self.sensor_width, self.sensor_height, 90)
         self.simulation_finished.connect(self._capture_succeeded)
         self.simulation_failed.connect(self._capture_failed)
@@ -488,7 +490,7 @@ class MainWindow(QMainWindow):
             self.on_simulation_failed("Could not connect to the CARLA server.")
             return
         self.is_running = True
-        self.timer = self.startTimer(100)
+        self.timer_id = self.startTimer(100)
         scenario_file = None
         if self.is_corner_case:
             scenario_file = str(PYTHON_DIR / f"{self.selected_example}.yaml")
@@ -499,20 +501,18 @@ class MainWindow(QMainWindow):
         self.pending_error = None
         self.stop_requested = False
         self.simulation_thread = QThread(self)
+        self.simulation_outcome = WorkerOutcome()
         self.simulation_worker = SimulationWorker(
             length=self.scenario_length, output_dir=self.scenario_folder, seed=0,
-            scenario_path=scenario_file)
+            scenario_path=scenario_file, outcome=self.simulation_outcome)
         self.simulation_worker.moveToThread(self.simulation_thread)
         self.simulation_thread.started.connect(self.simulation_worker.run)
         self.simulation_worker.preview_ready.connect(self.on_preview_ready, Qt.QueuedConnection)
         self.simulation_worker.progress_changed.connect(self.progress_bar.setValue, Qt.QueuedConnection)
-        self.simulation_worker.succeeded.connect(self._capture_succeeded, Qt.QueuedConnection)
-        self.simulation_worker.failed.connect(self._capture_failed, Qt.QueuedConnection)
-        self.simulation_worker.succeeded.connect(self.simulation_thread.quit)
-        self.simulation_worker.failed.connect(self.simulation_thread.quit)
-        self.simulation_worker.succeeded.connect(self.simulation_worker.deleteLater)
-        self.simulation_worker.failed.connect(self.simulation_worker.deleteLater)
-        self.simulation_thread.finished.connect(self._simulation_thread_finished)
+        self.simulation_worker.finished.connect(self.simulation_worker.deleteLater, Qt.DirectConnection)
+        self.simulation_worker.destroyed.connect(self.simulation_thread.quit, Qt.DirectConnection)
+        self.simulation_thread.finished.connect(self.simulation_thread.deleteLater)
+        self.simulation_thread.destroyed.connect(self._simulation_thread_destroyed)
         self.simulation_thread.start()
 
     @pyqtSlot(object)
@@ -545,21 +545,27 @@ class MainWindow(QMainWindow):
         self.pending_error = message
 
     @pyqtSlot()
-    def _simulation_thread_finished(self):
-        result, error = self.pending_result, self.pending_error
+    def _simulation_thread_destroyed(self):
+        result = self.simulation_outcome.result if self.simulation_outcome else self.pending_result
+        error = self.simulation_outcome.error if self.simulation_outcome else self.pending_error
+        if error:
+            self.simulation_failed.emit(error)
+        elif result is not None:
+            self.simulation_finished.emit(result)
         self.is_running = False
         self.start_action.setEnabled(True)
         self.stop_action.setEnabled(False)
         self.pause_action.setEnabled(False)
         self.folder_button.setEnabled(True)
         self.start_action.setText('Start')
-        if self.timer:
-            self.killTimer(self.timer)
-            self.timer = None
+        if self.timer_id is not None:
+            self.killTimer(self.timer_id)
+            self.timer_id = None
         self.client = None
         self.world = None
         self.simulation_worker = None
         self.simulation_thread = None
+        self.simulation_outcome = None
         if error:
             self.progress_label.setText("Simulation failed")
             QMessageBox.critical(self, "CARLA simulation failed", error)
@@ -577,21 +583,25 @@ class MainWindow(QMainWindow):
 
     def _start_postprocessing(self, output_dir):
         self.postprocessing_thread = QThread(self)
+        self.postprocessing_outcome = WorkerOutcome()
         self.postprocessing_worker = PostProcessingWorker(
-            output_dir, str(PYTHON_DIR / 'environment_object.json'))
+            output_dir, str(PYTHON_DIR / 'environment_object.json'),
+            outcome=self.postprocessing_outcome)
         self.postprocessing_worker.moveToThread(self.postprocessing_thread)
         self.postprocessing_thread.started.connect(self.postprocessing_worker.run)
-        self.postprocessing_worker.succeeded.connect(self.postprocessing_thread.quit)
-        self.postprocessing_worker.failed.connect(self.on_postprocessing_failed, Qt.QueuedConnection)
-        self.postprocessing_worker.failed.connect(self.postprocessing_thread.quit)
-        self.postprocessing_worker.succeeded.connect(self.postprocessing_worker.deleteLater)
-        self.postprocessing_worker.failed.connect(self.postprocessing_worker.deleteLater)
-        self.postprocessing_thread.finished.connect(self._postprocessing_finished)
+        self.postprocessing_worker.finished.connect(self.postprocessing_worker.deleteLater, Qt.DirectConnection)
+        self.postprocessing_worker.destroyed.connect(self.postprocessing_thread.quit, Qt.DirectConnection)
+        self.postprocessing_thread.finished.connect(self.postprocessing_thread.deleteLater)
+        self.postprocessing_thread.destroyed.connect(self._postprocessing_thread_destroyed)
         self.postprocessing_thread.start()
 
-    def _postprocessing_finished(self):
+    def _postprocessing_thread_destroyed(self):
+        error = self.postprocessing_outcome.error if self.postprocessing_outcome else None
         self.postprocessing_worker = None
         self.postprocessing_thread = None
+        self.postprocessing_outcome = None
+        if error:
+            self.postprocessing_failed.emit(error)
         if self.close_pending:
             QTimer.singleShot(0, self.close)
 

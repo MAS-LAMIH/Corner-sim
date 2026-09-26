@@ -33,9 +33,23 @@ exception is active.
 The merged lifecycle work also regressed two compatibility points: public
 `MainWindow` lifecycle signals were absent, and the runtime rejected CARLA 0.9.16
 Traffic Manager bindings that expose a setter but no getter. The signals are again
-declared as `pyqtSignal(object)` and connected during initialization. Runtime tests
+declared with their typed `dict`/`str` signatures and connected during initialization. Runtime tests
 now cover setter-only owned managers, non-owned managers (never mutated), enable and
 disable failures, cancellation, and fresh world-settings restoration.
+
+A subsequent Windows run exposed a native Qt abort at both natural completion and
+Stop: `QObject::~QObject: Timers cannot be stopped from another thread`. The worker
+completion signal previously queued `QThread.quit` while also scheduling
+`worker.deleteLater`, then the GUI dropped both Python references from
+`QThread.finished`. That ordering did not prove the deferred worker deletion ran in
+the worker's owning thread. The corrected lifecycle is explicit: the worker stores
+its result outside the QObject, emits `finished`, schedules `deleteLater` directly in
+its own thread, and only its `destroyed` signal requests thread shutdown. The finished
+thread schedules its own deletion in the GUI thread, and `QThread.destroyed` performs
+GUI finalization. Simulation results/failures are emitted by `MainWindow` only after
+that chain completes. Post-processing uses the same ownership chain. The GUI's unused
+`QTimer`/native-timer-ID alias was also removed; its native timer is created and killed
+only by the GUI thread.
 
 ## Execution path verified in this pass
 
@@ -123,7 +137,7 @@ its schema.
 
 ## Exact validation performed in this pass
 
-- `python -m pytest -q`: 50 passed, 1 skipped. The skipped test is the offscreen
+- `python -m pytest -q`: 52 passed, 1 skipped. The skipped test is the offscreen
   QWidget smoke test because this host lacks the required Qt/OpenGL runtime; scenario
   validation and the QtCore worker tests passed. Skips are not counted as successful
   tests.

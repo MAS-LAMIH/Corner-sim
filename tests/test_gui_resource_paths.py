@@ -33,6 +33,13 @@ def test_startup_exception_handler_guards_uninitialized_window():
     assert "if main_window is not None and main_window.client is not None:" in source
 
 
+def test_public_lifecycle_signal_signatures_are_typed():
+    source = Path("Python/new_ui.py").read_text(encoding="utf-8")
+    assert "simulation_finished = pyqtSignal(dict)" in source
+    assert "simulation_failed = pyqtSignal(str)" in source
+    assert "postprocessing_failed = pyqtSignal(str)" in source
+
+
 def _method_source(name):
     source = Path("Python/new_ui.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -43,7 +50,7 @@ def _method_source(name):
 
 def test_stop_only_requests_cancellation_until_worker_cleanup_finishes():
     stop_source = _method_source("stop_scenario")
-    finished_source = _method_source("_simulation_thread_finished")
+    finished_source = _method_source("_simulation_thread_destroyed")
     assert "self.simulation_worker.stop()" in stop_source
     assert "self.generate_Scenario_name()" not in stop_source
     assert "self.client = None" not in stop_source
@@ -54,7 +61,7 @@ def test_stop_only_requests_cancellation_until_worker_cleanup_finishes():
 
 def test_cancellation_skips_postprocessing_and_does_not_close_window():
     stop_source = _method_source("stop_scenario")
-    finished_source = _method_source("_simulation_thread_finished")
+    finished_source = _method_source("_simulation_thread_destroyed")
     assert "self.close()" not in stop_source
     assert 'result.get("stopped")' in finished_source
     cancelled_branch, completed_branch = finished_source.split("elif result:", 1)
