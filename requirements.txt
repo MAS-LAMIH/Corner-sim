@@ -1,7 +1,9 @@
-PyQt5
-carla
-keyboard
-matplotlib
-numpy
-opencv-python
-psutil
+PyQt5>=5.15,<6
+carla>=0.9.14,<0.10
+keyboard>=0.13,<0.14
+matplotlib>=3.5,<4
+numpy>=1.21,<3
+opencv-python>=4.5,<5
+Pillow>=9,<12
+psutil>=5.9,<7
+PyYAML>=6,<7

@@ -7,7 +7,6 @@ import platform
 import subprocess
 import os
 import psutil
-import yaml
 import random
 import math
 import time
@@ -53,12 +52,8 @@ multiple_bbox_tags = ['sidewalks', 'vegetation', 'traffic_sign', 'sky', 'traffic
 
 
 def build_projection_matrix(w, h, fov):
-    focal = w / (2.0 * np.tan(fov * np.pi / 360.0))
-    K = np.identity(3)
-    K[0, 0] = K[1, 1] = focal
-    K[0, 2] = w / 2.0
-    K[1, 2] = h / 2.0
-    return K
+    from cornersim.geometry import build_projection_matrix as maintained_projection_matrix
+    return maintained_projection_matrix(int(w), int(h), float(fov))
 
 
 def convert_coordinates(reference_transform, location, orientation):
@@ -145,9 +140,9 @@ def pedestrian_jump(pedestrian, spectator_transform, location, orientation, spee
 
 
 def load_scenario_from_yaml(file_path):
-    with open(file_path, 'r') as file:
-        scenario_data = yaml.safe_load(file)
-    return scenario_data
+    # Preserve the legacy list return type while enforcing the maintained schema.
+    from cornersim.scenario import load_scenario
+    return [dict(action) for action in load_scenario(file_path).actions]
 
 
 def move_spectator(world, location, orientation):
@@ -441,8 +436,8 @@ def sensor_callback(world, actor, sensor_data, synchro_queue, sensor_name, K=Non
 
 
 config = configparser.ConfigParser()
-config.read('config.ini')
-carla_path = config.get('Carla', 'path')
+config.read(os.path.join(os.path.dirname(__file__), 'config.ini'))
+carla_path = os.environ.get('CARLA_ROOT', config.get('Carla', 'path', fallback='')).strip()
 
 
 def check_carla_server():
@@ -473,6 +468,8 @@ def check_connection_status(client):
 
 def launch_carla_server():
     # launch the Carla server
+    if not carla_path:
+        raise RuntimeError("CARLA_ROOT or Python/config.ini [Carla] path must be configured to launch CARLA")
     os_name = platform.system()
 
     print(f"Opening CARLA from path: {carla_path}")
@@ -620,23 +617,11 @@ def get_image_point(loc, K, w2c):
     # Calculate 2D projection of 3D coordinate
 
     # Format the input coordinate (loc is a carla.Position object)
-    point = np.array([loc.x, loc.y, loc.z, 1])
-    # transform to camera coordinates
-    point_camera = np.dot(w2c, point)
-
-    # New we must change from UE4's coordinate system to an "standard"
-    # (x, y ,z) -> (y, -z, x)
-    # and we remove the fourth componebonent also
-    # point_camera = [point_camera[0], -point_camera[1], point_camera[2]]
-    point_camera = [point_camera[1], -point_camera[2], point_camera[0]]
-
-    # now project 3D->2D using the camera matrix
-    point_img = np.dot(K, point_camera)
-    # normalize
-    point_img[0] /= point_img[2]
-    point_img[1] /= point_img[2]
-
-    return point_img[0:2]
+    from cornersim.geometry import project_point
+    projected = project_point((loc.x, loc.y, loc.z), K, w2c)
+    if projected is None:
+        raise ValueError("point is behind the camera or intersects the near plane")
+    return np.asarray(projected[:2])
 
 
 def update_bounding_box_view_3D(view, camera, image, semantic_image, bounding_box_set, transform, image_ref, counter,
@@ -664,6 +649,13 @@ def update_bounding_box_view_3D(view, camera, image, semantic_image, bounding_bo
             try:
                 corners = bb.get_world_vertices(carla.Transform())
                 distance = compute_bb_distance(camera.get_transform().location, corners)
+                from cornersim.geometry import project_bbox
+                projected_box = project_bbox(
+                    [(corner.x, corner.y, corner.z) for corner in corners], self.K, world_2_camera,
+                    image.width, image.height, min_area=4.0,
+                )
+                if projected_box is None:
+                    continue
                 corners = [get_image_point(corner, self.K, world_2_camera) for corner in corners]
                 object_color = CLASS_MAPPING[label]
                 object_color = (object_color[2], object_color[1], object_color[0])
@@ -697,8 +689,8 @@ def update_bounding_box_view_3D(view, camera, image, semantic_image, bounding_bo
 
                 # Use NumPy to calculate min/max corners
                 corners = np.array(corners, dtype=int)
-                x_min, y_min = np.min(corners, axis=0).astype(int)
-                x_max, y_max = np.max(corners, axis=0).astype(int)
+                x_min, y_min = int(projected_box.min_x), int(projected_box.min_y)
+                x_max, y_max = int(projected_box.max_x), int(projected_box.max_y)
                 included = False
                 # Extract the region of interest from the semantic image using the bounding box coordinates
                 # Assume that 'semantic_image' is a CARLA Image object
@@ -715,7 +707,7 @@ def update_bounding_box_view_3D(view, camera, image, semantic_image, bounding_bo
 
                 # If the ratio of the number of pixels with the correct semantic color to the total number of pixels is greater than or equal to 0.5, process the bounding box
 
-                if count * 2 >= total:
+                if total > 0 and count * 2 >= total:
 
                     for processed_bb in processed_boxes[label]:
                         if x_min >= processed_bb[0] and x_max <= processed_bb[2] and y_min >= processed_bb[
