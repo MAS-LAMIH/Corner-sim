@@ -33,6 +33,8 @@ def parse_args() -> argparse.Namespace:
                         help="request cooperative Stop if the experiment exceeds this duration")
     parser.add_argument("--log")
     parser.add_argument("--no-write", action="store_true")
+    parser.add_argument("--postprocessing", choices=("real", "skip"), default="real",
+                        help="run the real post-processor or a logged no-op")
     return parser.parse_args()
 
 
@@ -117,6 +119,31 @@ def main() -> int:
             return result
 
         window.simulation_runner = traced_runner
+        original_start_postprocessing = window._start_postprocessing
+
+        def traced_start_postprocessing(output_dir):
+            log.emit("postprocess.transition.begin", output_dir=output_dir,
+                     modules=module_state(), qt_thread_id=int(QThread.currentThreadId()))
+            if args.postprocessing == "skip":
+                def processor(*values):
+                    log.emit("postprocess.skip.worker", arguments=values, modules=module_state())
+            else:
+                log.emit("postprocess.import.begin", modules=module_state())
+                from image_tools import post_process
+                log.emit("postprocess.import.end", modules=module_state())
+
+                def processor(*values):
+                    log.emit("postprocess.worker.entry", arguments=values, modules=module_state())
+                    result = post_process(*values)
+                    log.emit("postprocess.worker.return", modules=module_state())
+                    return result
+
+            window.postprocessing_processor = processor
+            original_start_postprocessing(output_dir)
+            log.emit("postprocess.transition.return", worker_created=window.postprocessing_worker is not None,
+                     modules=module_state(), qt_thread_id=int(QThread.currentThreadId()))
+
+        window._start_postprocessing = traced_start_postprocessing
         window.simulation_finished.connect(
             lambda result: (state.__setitem__("finished_signal", True),
                             log.emit("qt.simulation_finished", result=result,

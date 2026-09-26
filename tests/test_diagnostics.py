@@ -133,3 +133,29 @@ def test_windows_matrix_uses_fresh_processes_and_separate_logs():
     assert 'Run-Probe "A-standalone-live"' in source
     assert 'Run-Probe "B3-gui-fake-repeat"' in source
     assert 'Run-Probe "C1-gui-live-natural"' in source
+    assert 'Run-Probe "C0-gui-live-natural-no-post"' in source
+    assert 'Run-Probe "E1-post-standalone-main"' in source
+    assert 'Run-Probe "E4-post-qt-thread"' in source
+
+
+def test_live_harness_brackets_real_postprocessing_transition():
+    source = Path("diagnostics/run_gui_live.py").read_text(encoding="utf-8")
+    for checkpoint in (
+        "postprocess.transition.begin",
+        "postprocess.import.begin",
+        "postprocess.import.end",
+        "postprocess.worker.entry",
+        "postprocess.worker.return",
+        "postprocess.transition.return",
+    ):
+        assert checkpoint in source
+    assert 'choices=("real", "skip")' in source
+
+
+def test_postprocess_harness_help_is_available_without_loading_native_dependencies():
+    completed = subprocess.run(
+        [sys.executable, "diagnostics/run_postprocess.py", "--help"],
+        cwd=Path(__file__).parents[1], capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0, completed.stderr
+    assert "standalone-main" in completed.stdout
+    assert "qt-thread" in completed.stdout

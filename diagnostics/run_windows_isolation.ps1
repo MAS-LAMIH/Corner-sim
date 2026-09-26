@@ -54,7 +54,29 @@ if ($RunLive) {
         "diagnostics\run_standalone.py", "--ticks", "5", "--capture-interval", "1",
         "--output", (Join-Path $runDirectory "standalone-dataset"))
 
-    # C: Original integration shape. First run naturally, then repeat with Stop.
+    # E: use identical copies of A's completed dataset to isolate import,
+    # post-processing, Python-thread, and Qt-interaction effects.
+    Run-Probe "E1-post-standalone-main" @(
+        "diagnostics\run_postprocess.py", "standalone-main",
+        "--dataset", (Join-Path $runDirectory "standalone-dataset"),
+        "--copy-to", (Join-Path $runDirectory "post-standalone-main-dataset"))
+    Run-Probe "E2-post-standalone-thread" @(
+        "diagnostics\run_postprocess.py", "standalone-thread",
+        "--dataset", (Join-Path $runDirectory "standalone-dataset"),
+        "--copy-to", (Join-Path $runDirectory "post-standalone-thread-dataset"))
+    Run-Probe "E3-post-qt-import" @(
+        "diagnostics\run_postprocess.py", "qt-import")
+    Run-Probe "E4-post-qt-thread" @(
+        "diagnostics\run_postprocess.py", "qt-thread",
+        "--dataset", (Join-Path $runDirectory "standalone-dataset"),
+        "--copy-to", (Join-Path $runDirectory "post-qt-thread-dataset"))
+
+    # C0 controls for natural completion without real post-processing. C1 then
+    # changes only post-processing back to the production implementation.
+    Run-Probe "C0-gui-live-natural-no-post" @(
+        "diagnostics\run_gui_live.py", "--ticks", "5", "--capture-interval", "1",
+        "--postprocessing", "skip",
+        "--output", (Join-Path $runDirectory "gui-live-natural-no-post-dataset"))
     Run-Probe "C1-gui-live-natural" @(
         "diagnostics\run_gui_live.py", "--ticks", "5", "--capture-interval", "1",
         "--output", (Join-Path $runDirectory "gui-live-natural-dataset"))

@@ -99,6 +99,31 @@ line, but does not equate importing OpenCV with initializing HighGUI. To exercis
 that backend explicitly in its own process, append `--exercise-opencv-gui`. Append
 `--connect-carla` to a CARLA-containing probe only when the server is running.
 
+### E — post-processing isolation
+
+The supplied Windows results narrow the failure to the transition after successful
+natural simulation completion. Run these against the standalone dataset; `--copy-to`
+ensures every processor receives an independent copy:
+
+```powershell
+$source = "diagnostic-logs\20260926-214245\standalone-dataset"
+.\.venv\Scripts\python.exe -u -X faulthandler diagnostics\run_postprocess.py standalone-main --dataset $source --copy-to diagnostic-output\post-main --log diagnostic-logs\E1.jsonl
+.\.venv\Scripts\python.exe -u -X faulthandler diagnostics\run_postprocess.py standalone-thread --dataset $source --copy-to diagnostic-output\post-thread --log diagnostic-logs\E2.jsonl
+.\.venv\Scripts\python.exe -u -X faulthandler diagnostics\run_postprocess.py qt-import --log diagnostic-logs\E3.jsonl
+.\.venv\Scripts\python.exe -u -X faulthandler diagnostics\run_postprocess.py qt-thread --dataset $source --copy-to diagnostic-output\post-qt-thread --log diagnostic-logs\E4.jsonl
+```
+
+The updated `-RunLive` matrix performs these automatically, and also adds C0: the
+full live GUI natural-completion flow with a logged no-op post-processor. C0 and C1
+differ only in whether the real `image_tools.post_process` implementation is used.
+
+To run only that paired control on the affected host:
+
+```powershell
+.\.venv\Scripts\python.exe -u -X faulthandler diagnostics\run_gui_live.py --ticks 5 --capture-interval 1 --postprocessing skip --output diagnostic-output\C0 --log diagnostic-logs\C0.jsonl 1> diagnostic-logs\C0.stdout.log 2> diagnostic-logs\C0.stderr.log
+.\.venv\Scripts\python.exe -u -X faulthandler diagnostics\run_gui_live.py --ticks 5 --capture-interval 1 --postprocessing real --output diagnostic-output\C1 --log diagnostic-logs\C1.jsonl 1> diagnostic-logs\C1.stdout.log 2> diagnostic-logs\C1.stderr.log
+```
+
 ## Interpretation matrix
 
 | Result | What it supports | What it does **not** establish |
@@ -108,6 +133,10 @@ that backend explicitly in its own process, append `--exercise-opencv-gui`. Appe
 | A and B pass; C crashes | The failure requires the GUI/live-CARLA interaction or a dependency initialized only in that combination. | Whether PyQt, CARLA, or OpenCV owns the timer. |
 | D combined crashes but individual D probes pass | Import/initialization interaction is sufficient without capture. | Which later capture operation is responsible. |
 | D OpenCV compute passes but explicit HighGUI crashes | OpenCV's GUI backend is implicated; plain `cv2` import/compute is insufficient. | Whether CornerSim actually calls HighGUI in production. |
+| C0 passes and C1 crashes | Real post-processing, rather than capture cleanup or natural-completion GUI delivery, is required. | Whether import, OpenCV compute, multiprocessing, or their thread interaction is the cause. |
+| E1 and E2 pass; E3 passes; E4 crashes | Real post-processing specifically conflicts with a concurrent Qt event loop. | Which native library owns the QObject without a native stack. |
+| E1 passes and E2 crashes | Running post-processing from a non-main Python thread is sufficient, without PyQt. | That Qt is involved in the failing process. |
+| E3 crashes | Importing `image_tools`/OpenCV beside an active Qt application is sufficient. | That image processing or multiprocessing is involved. |
 | All probes pass, including repeated C | The reported sequence was not reproduced under that run's conditions. | A proof that the race is fixed; repeat and retain logs. |
 
 Absence of `runner.output_resolve.return` after `runner.output_resolve.begin` narrows
@@ -176,6 +205,31 @@ a native/CARLA callback. The existing traceback alone supports none of these as 
 root-cause conclusion.
 
 **Unresolved:** the identity, creator thread, owner thread, and destroying thread of
-the QObject; whether A or B reproduces on the affected Windows host; and whether the
-failure requires OpenCV HighGUI rather than merely importing `cv2`. Wait for the
-Windows matrix and native stack before changing production ownership again.
+the QObject; the complete B/D exit-code results; and whether the failure requires
+OpenCV computation, multiprocessing, or merely importing `cv2` beside PyQt. Wait for
+the C0/E matrix and native stack before changing production ownership again.
+
+## Evidence received from Windows run 20260926-214245
+
+This evidence changes the working boundary, but does not yet identify the native
+QObject:
+
+- **A passed:** five synchronized live frames were captured without PyQt or OpenCV;
+  every owned actor was destroyed, Traffic Manager was set asynchronous, and world
+  settings were restored to asynchronous mode with no fixed delta.
+- **C1 reached `runner.return`:** live GUI natural completion captured five frames,
+  completed actor/settings cleanup, completed the exact `Path.resolve` line, and
+  delivered `qt.simulation_finished` on the main Qt thread. The supplied tail has no
+  later idle/notifier/window/process-exit checkpoint.
+- **C2 passed:** Stop completed the same cleanup, delivered completion on the main Qt
+  thread, destroyed the notifier and window on that thread, returned event-loop code
+  zero, and exited with `cv2_loaded=false`.
+
+Therefore `Path.resolve`, capture cleanup, and notification of simulation completion
+are not the failing operation in that run. The first production-only action after the
+last C1 checkpoint is `_start_postprocessing`; C2 deliberately skips that action. This
+supports post-processing as the next isolation boundary, **not** a conclusion that
+OpenCV, `ProcessPoolExecutor`, or a specific QObject is the root cause. The new
+`postprocess.transition.*`, `postprocess.import.*`, and `postprocess.worker.*`
+checkpoints plus experiments C0/E distinguish those cases without changing production
+behavior.
