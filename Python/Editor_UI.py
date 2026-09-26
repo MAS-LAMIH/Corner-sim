@@ -27,6 +27,7 @@ import threading
 import configparser
 import psutil
 import copy
+from cornersim.geometry import build_projection_matrix as maintained_projection_matrix, project_point
 from tools import (
     copyImageData,
     max_projected_length,
@@ -690,12 +691,7 @@ class MainWindow(QMainWindow):
         return self.get_RGB_DATA(image)
 
     def build_projection_matrix(self, w, h, fov):
-        focal = w / (2.0 * np.tan(fov * np.pi / 360.0))
-        K = np.identity(3)
-        K[0, 0] = K[1, 1] = focal
-        K[0, 2] = w / 2.0
-        K[1, 2] = h / 2.0
-        return K
+        return maintained_projection_matrix(int(w), int(h), float(fov))
 
     
 
@@ -703,23 +699,10 @@ class MainWindow(QMainWindow):
         # Calculate 2D projection of 3D coordinate
 
         # Format the input coordinate (loc is a carla.Position object)
-        point = np.array([loc.x, loc.y, loc.z, 1])
-        # transform to camera coordinates
-        point_camera = np.dot(w2c, point)
-
-        # New we must change from UE4's coordinate system to an "standard"
-        # (x, y ,z) -> (y, -z, x)
-        # and we remove the fourth componebonent also
-        #point_camera = [point_camera[0], -point_camera[1], point_camera[2]]
-        point_camera = [point_camera[1], -point_camera[2], point_camera[0]]
-
-        # now project 3D->2D using the camera matrix
-        point_img = np.dot(K, point_camera)
-        # normalize
-        point_img[0] /= point_img[2]
-        point_img[1] /= point_img[2]
-
-        return point_img[0:2]
+        projected = project_point((loc.x, loc.y, loc.z), K, w2c)
+        if projected is None:
+            raise ValueError("point is behind the camera or intersects the near plane")
+        return np.asarray(projected[:2])
 
     def no_tighten_bb(self,sem_seg_image, x_min, y_min, x_max, y_max, object_color):
         return x_min, y_min, x_max, y_max
@@ -1165,7 +1148,6 @@ if __name__ == '__main__':
     #print(f"Out-of-view point: {point_out_of_view} -> image coordinates: {point_img}")
     main_window.show()
     sys.exit(app.exec_())
-
 
 
 
