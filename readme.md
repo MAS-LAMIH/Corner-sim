@@ -32,9 +32,14 @@ commit a machine-specific path.
 Start CARLA, then from the repository root run:
 
 ```bash
-cd Python
-python new_ui.py
+python Python/new_ui.py
 ```
+
+Launching from inside `Python/` remains supported. Sensor callbacks copy preview bytes
+and deliver them through queued Qt signals; all `QImage`, `QPixmap`, progress-bar, and
+widget updates happen on the GUI thread. Stop is cooperative: controls remain in a
+stopping state until sensors/actors are cleaned up and the original CARLA world and
+Traffic Manager settings have been restored. Cancelled runs are not post-processed.
 
 The GUI connects to localhost port 2000, lets users select taxonomy labels and an
 implemented YAML scenario, and displays/captures synchronized sensor views. Treat

@@ -1,10 +1,34 @@
 # CornerSim technical audit and validation status
 
-Updated: 2026-09-23
+Updated: 2026-09-26
+
+## Live Windows follow-up
+
+A Windows run with Python 3.12 and CARLA 0.9.16 proved that the previous mocked
+pipeline test did not cover Qt thread affinity or settings-proxy aliasing. Sensor
+callbacks were constructing `QPixmap` and modifying `QLabel` objects outside the GUI
+thread; Stop reset GUI/client state before CARLA cleanup completed; and retaining a
+CARLA settings object was not sufficient evidence that its original values were
+independent. The live run captured a complete sample and removed actors, but crashed
+the GUI on Stop and left the world synchronous at a 0.1 second fixed delta.
+
+This pass removes Qt from `Synchro3` and `gui_workers`: callbacks copy raw BGRA bytes
+into immutable `PreviewFrame` values and emit queued signals. Only the GUI-thread
+`MainWindow.on_preview_ready` creates `QImage`/`QPixmap` and updates labels. Progress,
+results, and errors also cross threads through Qt signals. Stop is cooperative and
+does not reset state or start post-processing; finalization happens from the
+`QThread.finished` handler after the runtime context has restored CARLA. Cancellation
+explicitly skips post-processing. Window closure is asynchronous: it ignores the
+close event while cleanup is running and closes after the worker finishes.
+
+`CarlaRuntime` now snapshots primitive `synchronous_mode` and
+`fixed_delta_seconds` values before mutation, restores them onto a fresh settings
+object, and requires Traffic Manager to expose its prior synchronization state. It
+reports cleanup failures even when another exception is active.
 
 ## Execution path verified in this pass
 
-The GUI path is `new_ui.MainWindow.start_scenario` → `SimulationThread` →
+The GUI path is `new_ui.MainWindow.start_scenario` → `QThread`/`SimulationWorker` →
 `Synchro3.run_carla_simulation` → `CarlaRuntime` → per-run sensor queue →
 `FrameSynchronizer`/`collect_frame` → `SampleWriter` → `image_tools.post_process`.
 This is now the same path that uses the maintained lifecycle, synchronization,
@@ -29,10 +53,13 @@ mode retains the prototype's seeded random-prop workflow.
 | High | Fixed timestep was incorrectly hard-coded to one second rather than `1/fps`. | `CarlaRuntime.__enter__` | `test_runtime_restores_settings_and_destroys_in_reverse_after_exception` | Resolved. |
 | High | Global sensor queue retained stale callbacks across runs. | Per-run queue in `Synchro3.run_carla_simulation`; sensor ownership in `CarlaRuntime` | `tests/test_capture_pipeline.py` | Resolved. |
 | High | Dataset files were non-atomic, overwrite-prone, and had no completion contract. | `cornersim.dataset.SampleWriter/atomic_write_json` | `tests/test_dataset.py`, `tests/test_capture_pipeline.py` | Resolved for capture metadata/object data. CARLA PNGs are staged and completion metadata is published last. Post-processing remains a distinct phase and validator rejects missing labels. |
-| High | GUI Stop did not stop its worker; Pause did not pause it; repeated Start added state/callbacks; close lacked cleanup. | `new_ui.SimulationThread`, `start_scenario`, `stop_scenario`, `pause_scenario`, `closeEvent` | Core stop/cleanup is mocked in `tests/test_capture_pipeline.py`; Qt interaction is statically verified only. | Partially resolved: cooperative controls and one worker per run are implemented; no automated Qt event-loop test. |
+| High | GUI Stop did not stop its worker; Pause did not pause it; repeated Start added state/callbacks; close lacked cleanup. | `gui_workers.SimulationWorker`; `new_ui.start_scenario/stop_scenario/pause_scenario/closeEvent` | `tests/test_gui_workers.py`, `tests/test_gui_resource_paths.py`, `tests/test_capture_pipeline.py` | Resolved in QtCore event-loop and mocked-CARLA tests; full QWidget/live-CARLA confirmation remains unavailable. |
 | High | Scenario validation/seeding existed but production ignored it. | `Synchro3._apply_scenario/run_carla_simulation`; `tools.load_scenario_from_yaml` | `tests/test_scenario.py`; live behavior unavailable | Resolved by code and unit tests; live actor placement remains unverified. |
 | High | Semantic and instance correspondence lacked dimension checks and deterministic canonical labels. | `annotations_from_masks` | `tests/test_annotations.py`, `tests/test_legacy_annotation_integration.py` | Resolved; `car` wins over its legacy `vehicle` color alias. |
 | High | CARLA end-to-end behavior was unverified. | Integration test and manual connection probe | `tests/integration/test_carla_connection.py` | Unresolved: Python client imports, but localhost:2000 timed out and no server executable was found. |
+| Critical | CARLA callbacks directly updated Qt widgets and built pixmaps off the GUI thread, crashing Stop on Windows. | `Python/Synchro3.py::sensor_callback`, `Python/gui_workers.py`, `new_ui.MainWindow.on_preview_ready` | `tests/test_gui_workers.py`; Windows observation | Resolved by code/unit tests; the repaired GUI has not been rerun against live CARLA in this environment. |
+| Critical | Stop reset state immediately and close synchronously joined a worker, racing cleanup and Qt object destruction. | `new_ui.MainWindow.stop_scenario/_simulation_thread_finished/closeEvent` | `tests/test_gui_resource_paths.py`, `tests/test_gui_workers.py` | Resolved by cooperative cancellation and asynchronous finalization; Qt widget integration is not executable on this headless host. |
+| Critical | Original CARLA settings could be represented by an aliased mutable proxy and were not reliably restored. | `cornersim.runtime.CarlaRuntime` | `tests/test_runtime.py::test_aliased_settings_values_are_restored_after_cancellation` | Resolved using immutable value snapshots and fresh restore settings; awaits repeat live validation. |
 | Medium | Machine-specific CARLA path and working-directory-sensitive config. | `Python/tools.py` configuration | Import/compile checks | Resolved with `CARLA_ROOT`, file-relative config, and actionable launch error. |
 | Medium | Dataset split leakage from consecutive frames/repeated configurations. | No splitting feature exists. | None | Unresolved. Split by run/scenario/seed, never random frame, until group-aware manifests are implemented. |
 | Medium | OpenCV GUI wheel requires `libGL.so.1` in this headless environment. | `requirements.txt`/legacy rendering | Unit annotation core avoids OpenCV | Partially resolved. GUI hosts still need system OpenGL; a future headless extra may use `opencv-python-headless`. |
@@ -61,7 +88,9 @@ its schema.
    ticks against CARLA-compatible fakes. It captured equal frame IDs, wrote completion
    metadata/object snapshots, stopped sensors, destroyed every actor, restored world
    settings, and restored Traffic Manager asynchronous mode.
-4. **Live CARLA:** **not performed**. `carla` imported successfully, but a three-second
+4. **Live CARLA:** the user-provided Windows observation verified capture and exposed
+   the defects above, but it predates this fix. **No post-fix live CARLA run was
+   performed in this environment.** `carla` imported successfully, but a three-second
    connection attempt to `127.0.0.1:2000` timed out; no CARLA server executable was on
    `PATH`. Renderer, spawn collision behavior, semantic palette byte order, real sensor
    timing, repeated live runs, occlusion fidelity, and scientific output remain unverified.
@@ -83,16 +112,20 @@ its schema.
 
 ## Exact validation performed in this pass
 
-- `python -m pytest -q`: 31 passed, 1 skipped. The skipped test is YAML-file loading
+- `python -m pytest -q`: 45 passed, 1 skipped. The skipped test is YAML-file loading
   because PyYAML is unavailable; validation of in-memory scenarios passed. Skips are
   not counted as successful tests.
 - `python -m compileall -q cornersim Python`: passed.
 - `git diff --check`: passed.
+- `QT_QPA_PLATFORM=offscreen python Python/new_ui.py`: could not start on this
+  headless Linux host because the installed PyQt5/OpenCV stack requires missing
+  `libGL.so.1`. Resource-path behavior is covered by source-level regression tests,
+  while the repaired widget flow still requires Windows/live-GUI confirmation.
 - CARLA probe using `carla.Client('127.0.0.1', 2000)` with a 3-second timeout: failed
   with a simulator timeout. Therefore the opt-in live integration test was not run as
   a successful test.
 
 CornerSim is **not fully or scientifically validated**. The highest priority next step
-is two repeated short runs against CARLA 0.9.14 with inspection of frame metadata,
+is two repeated short runs against the supported CARLA version with inspection of frame metadata,
 semantic colors, annotations, cleanup, and deterministic seeds, followed by grouped
 train/validation/test manifest support.

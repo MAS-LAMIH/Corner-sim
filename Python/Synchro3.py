@@ -11,6 +11,7 @@ import math
 import threading
 import time
 from typing import Any
+from dataclasses import dataclass
 
 import carla
 import numpy as np
@@ -42,31 +43,25 @@ class ActorInfo:
         self.type = actor.type_id
 
 
-def update_progress_bar(current_tick: int, progress_bar: Any, max_ticks: int) -> None:
-    if progress_bar is not None and current_tick < max_ticks:
-        progress_bar.setValue(int(current_tick / max_ticks * 100))
+@dataclass(frozen=True)
+class PreviewFrame:
+    """Owned BGRA sensor bytes safe to transfer across Qt threads."""
+
+    sensor_name: str
+    frame: int
+    width: int
+    height: int
+    raw_data: bytes
 
 
-def update_camera_view(image: Any, view: Any, desired_width: int = 600, desired_height: int = 400,
-                       city_scape_convert: bool = False) -> None:
-    if view is None:
-        return
-    from PyQt5.QtCore import Qt
-    from PyQt5.QtGui import QImage, QPixmap
-    if city_scape_convert:
-        image.convert(carla.ColorConverter.CityScapesPalette)
-    pixels = np.frombuffer(image.raw_data, dtype=np.uint8).reshape((image.height, image.width, 4))[..., :3]
-    q_image = QImage(bytes(pixels.data), image.width, image.height, QImage.Format_RGB888).rgbSwapped()
-    view.setPixmap(QPixmap.fromImage(q_image.scaled(desired_width, desired_height, Qt.KeepAspectRatio)))
-
-
-def sensor_callback(sensor_data: Any, sensor_queue: Queue, sensor_name: str, rgb_label: Any = None,
-                    semantic_label: Any = None, instance_label: Any = None) -> None:
+def sensor_callback(sensor_data: Any, sensor_queue: Queue, sensor_name: str,
+                    preview_callback: Any = None) -> None:
     """Queue every measurement; sampling decisions are made after same-frame aggregation."""
-    targets = {"rgb": rgb_label, "semantic_segmentation": semantic_label, "instance_segmentation": instance_label}
     if sensor_name == "semantic_segmentation":
         sensor_data.convert(carla.ColorConverter.CityScapesPalette)
-    update_camera_view(sensor_data, targets[sensor_name], 600, 300)
+    if preview_callback is not None:
+        preview_callback(PreviewFrame(sensor_name, sensor_data.frame, sensor_data.width,
+                                      sensor_data.height, bytes(sensor_data.raw_data)))
     sensor_queue.put((sensor_data.frame, sensor_name, sensor_data))
 
 
@@ -167,9 +162,12 @@ def run_carla_simulation(rgb_label: Any = None, semantic_label: Any = None, inst
                          seed: int = 0, stop_event: threading.Event | None = None,
                          capture_interval: int = 20, client: Any = None,
                          scenario_path: str | os.PathLike[str] | None = None,
-                         pause_event: threading.Event | None = None) -> dict[str, Any]:
+                         pause_event: threading.Event | None = None,
+                         preview_callback: Any = None, progress_callback: Any = None) -> dict[str, Any]:
     """Run one deterministic, synchronized experiment and always restore CARLA state."""
-    del image_width, image_height  # kept for public API compatibility
+    # Widget arguments are retained for API compatibility but deliberately ignored:
+    # CARLA callbacks must never touch Qt objects.
+    del image_width, image_height, rgb_label, semantic_label, instance_label, progress_bar
     if max_tick < 1 or capture_interval < 1:
         raise ValueError("max_tick and capture_interval must be positive")
     seed_everything(seed)
@@ -209,7 +207,7 @@ def run_carla_simulation(rgb_label: Any = None, semantic_label: Any = None, inst
             sensor = runtime.own(world.spawn_actor(blueprint, carla.Transform(carla.Location(x=2.5, z=2.2)),
                                                    attach_to=ego))
             sensor.listen(lambda image, sensor_name=name: sensor_callback(
-                image, queue, sensor_name, rgb_label, semantic_label, instance_label))
+                image, queue, sensor_name, preview_callback))
             sensors.append(sensor)
         camera = sensors[0]
         scenario_actors = _apply_scenario(scenario_path, world, blueprints, runtime, ego) if scenario_path else []
@@ -234,7 +232,8 @@ def run_carla_simulation(rgb_label: Any = None, semantic_label: Any = None, inst
                 if writer is not None:
                     writer.write(frame, synchronized.measurements, snapshot)
                 captured.append(frame)
-            update_progress_bar(tick_index + 1, progress_bar, max_tick)
+            if progress_callback is not None:
+                progress_callback(int((tick_index + 1) / max_tick * 100))
     return {"captured_frames": captured, "dropped_frames": synchronizer.dropped_frames,
             "stopped": stop_event.is_set(), "output_dir": str(Path(output_dir).resolve())}
 

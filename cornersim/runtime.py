@@ -21,20 +21,39 @@ class CarlaRuntime(AbstractContextManager["CarlaRuntime"]):
         self.world = world
         self.fps = fps
         self.traffic_manager = traffic_manager
-        self.original_settings: Any = None
+        self.original_synchronous_mode: bool | None = None
+        self.original_fixed_delta_seconds: float | None = None
         self.original_tm_sync: bool | None = None
         self.actors: list[Any] = []
 
     def __enter__(self) -> "CarlaRuntime":
-        self.original_settings = self.world.get_settings()
         settings = self.world.get_settings()
+        # Store immutable values before modifying the settings object. Some CARLA
+        # bindings/fakes may return aliased proxy objects from get_settings().
+        self.original_synchronous_mode = bool(settings.synchronous_mode)
+        self.original_fixed_delta_seconds = settings.fixed_delta_seconds
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 1.0 / self.fps
         self.world.apply_settings(settings)
         if self.traffic_manager is not None:
             getter = getattr(self.traffic_manager, "get_synchronous_mode", None)
-            self.original_tm_sync = getter() if getter else False
-            self.traffic_manager.set_synchronous_mode(True)
+            if not callable(getter):
+                # Restore the world before refusing to enter a lifecycle we cannot
+                # safely reverse.
+                settings = self.world.get_settings()
+                settings.synchronous_mode = self.original_synchronous_mode
+                settings.fixed_delta_seconds = self.original_fixed_delta_seconds
+                self.world.apply_settings(settings)
+                raise RuntimeError("Traffic Manager cannot report its synchronous mode; refusing unsafe mutation")
+            self.original_tm_sync = bool(getter())
+            try:
+                self.traffic_manager.set_synchronous_mode(True)
+            except Exception:
+                settings = self.world.get_settings()
+                settings.synchronous_mode = self.original_synchronous_mode
+                settings.fixed_delta_seconds = self.original_fixed_delta_seconds
+                self.world.apply_settings(settings)
+                raise
         return self
 
     def own(self, actor: Any) -> Any:
@@ -61,15 +80,21 @@ class CarlaRuntime(AbstractContextManager["CarlaRuntime"]):
                 self.traffic_manager.set_synchronous_mode(bool(self.original_tm_sync))
             except Exception as error:
                 errors.append(error)
-        if self.original_settings is not None:
+        if self.original_synchronous_mode is not None:
             try:
-                self.world.apply_settings(self.original_settings)
+                settings = self.world.get_settings()
+                settings.synchronous_mode = self.original_synchronous_mode
+                settings.fixed_delta_seconds = self.original_fixed_delta_seconds
+                self.world.apply_settings(settings)
             except Exception as error:
                 errors.append(error)
         return errors
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
         cleanup_errors = self.close()
-        if exc is None and cleanup_errors:
-            raise RuntimeError(f"CARLA cleanup failed: {cleanup_errors!r}") from cleanup_errors[0]
+        if cleanup_errors:
+            message = f"CARLA cleanup failed: {cleanup_errors!r}"
+            if exc is not None:
+                message += f" while handling {exc!r}"
+            raise RuntimeError(message) from (exc or cleanup_errors[0])
         return False

@@ -1,5 +1,6 @@
 import json
 import sys
+import threading
 from types import SimpleNamespace
 
 sys.path.insert(0, "Python")
@@ -141,3 +142,18 @@ def test_actual_capture_pipeline_writes_only_complete_same_frame_samples_and_cle
     assert client.traffic.sync is False
     assert all(not actor.is_alive for actor in client.world.actors)
     assert all(sensor.stopped for sensor in client.world.sensors)
+
+
+def test_actual_capture_pipeline_restores_settings_after_cancellation(tmp_path, monkeypatch):
+    monkeypatch.setattr(Synchro3, "carla", fake_carla())
+    client = FakeClient()
+    stop_event = threading.Event()
+    stop_event.set()
+    result = Synchro3.run_carla_simulation(
+        max_tick=2, output_dir=tmp_path, client=client, stop_event=stop_event)
+    assert result["stopped"] is True
+    assert result["captured_frames"] == []
+    assert client.world.applied[-1].synchronous_mode is False
+    assert client.world.applied[-1].fixed_delta_seconds is None
+    assert client.traffic.sync is False
+    assert all(not actor.is_alive for actor in client.world.actors)
