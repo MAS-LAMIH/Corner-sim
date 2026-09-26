@@ -19,3 +19,6 @@ cornersim = "cornersim.cli:main"
 testpaths = ["tests"]
 norecursedirs = ["tests/integration"]
 markers = ["carla: requires a running CARLA simulator"]
+
+[tool.setuptools.packages.find]
+include = ["cornersim*"]
