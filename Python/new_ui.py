@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import QApplication, QAction, QMainWindow, QMenu, QVBoxLayo
 from PyQt5.QtCore import QUrl
 from PyQt5.QtGui import QDesktopServices, QIcon
 from PyQt5.QtGui import QIcon, QImage, QPixmap
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, QTimer, QThread, pyqtSignal, pyqtSlot
 # from PyQt5.QtCore import AspectRatioMode
 from PyQt5 import QtGui
 import time
@@ -14,6 +14,7 @@ import numpy as np
 import cv2
 import keyboard
 import os
+from pathlib import Path
 from queue import Queue
 from queue import Empty
 from collections import namedtuple
@@ -25,8 +26,13 @@ import platform
 import threading
 import configparser
 
-from Synchro3 import run_carla_simulation
-from image_tools import post_process
+PYTHON_DIR = Path(__file__).resolve().parent
+REPO_ROOT = PYTHON_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from Synchro3 import PreviewFrame
+from gui_workers import PostProcessingWorker, SimulationWorker
 from tools import (
     copyImageData,
     max_projected_length,
@@ -71,8 +77,7 @@ from corner_case_form import CornerCaseEditor, CornerCaseForm
 
 
 def create_directory(scenario_name):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    exec_path = os.path.join(script_dir, 'execution')
+    exec_path = PYTHON_DIR / 'execution'
     dir_path = os.path.join(exec_path, scenario_name)
     os.makedirs(dir_path, exist_ok=True)
     return os.path.abspath(dir_path)
@@ -82,62 +87,13 @@ def write_data_to_disk():
     # Iterate over the data list and write each item to disk
     print('writing output to disk')
 
-
-
-class SimulationThread(threading.Thread):
-    def __init__(self, rgb_label, semantic_label, instance_label, length=200, progress_bar=None):
-        super().__init__()
-        self.rgb_label = rgb_label
-        self.semantic_label = semantic_label
-        self.instance_label = instance_label
-        self.scenario_length=length
-        self.progress_bar= progress_bar
-
-    def run(self):
-        
-        try:
-            # Run your CARLA simulation code here
-            run_carla_simulation(
-                rgb_label=self.rgb_label,
-                semantic_label=self.semantic_label,
-                instance_label=self.instance_label,
-                max_tick=self.scenario_length,
-                progress_bar = self.progress_bar
-
-            )
-        except Exception as e:
-            # Handle any exceptions that might occur during simulation
-            print(f"Simulation thread exception: {e}")
-        finally:
-            # Code to execute after the simulation thread is terminated
-            print("Simulation thread terminated")
-            post_processing_thread = PostProcessingThread('images', 'environment_object.json')
-            post_processing_thread.start()
-
-            #close_carla_server()
-class PostProcessingThread(threading.Thread):
-    def __init__(self, batch_folder, catalog_json_filename):
-        super().__init__()
-        self.batch_folder = batch_folder
-        self.catalog_json_filename = catalog_json_filename
-        
-
-    def run(self):
-        
-        try:
-            # Run your CARLA simulation code here
-             post_process(self.batch_folder, self.catalog_json_filename)
-        except Exception as e:
-            # Handle any exceptions that might occur during simulation
-            print(f"PostProcessing thread exception: {e}")
-        finally:
-            # Code to execute after the simulation thread is terminated
-            print("PostProcessing thread terminated")
-            #close_carla_server()
 class MainWindow(QMainWindow):
-    update_rgb_label = pyqtSignal(QImage)
-    update_semantic_label = pyqtSignal(QImage)
-    update_instance_label = pyqtSignal(QImage)
+    # Public compatibility signals used by integrations built against the earlier
+    # GUI API. Internal workers use their own queued signals.
+    simulation_finished = pyqtSignal(object)
+    simulation_failed = pyqtSignal(object)
+    postprocessing_failed = pyqtSignal(object)
+
     def __init__(self):
         super().__init__()
         self.data = None
@@ -183,7 +139,6 @@ class MainWindow(QMainWindow):
         self.scenario_length = 100
         self.x = 0
         self.scenario_tick = 0
-        self.progress_updated = pyqtSignal(int)
         self.scenario_name = ''
         self.scenario_folder = ''
         self.global_imabe_error = 0
@@ -204,15 +159,26 @@ class MainWindow(QMainWindow):
         self.selected_subcategory = "Anomalous Scenario"
         self.selected_example = "Example"
         self.corner_case_form = None
-        self.CornerCaseEditor = CornerCaseEditor('CC_terminology.json', self)
+        self.CornerCaseEditor = CornerCaseEditor(str(PYTHON_DIR / 'CC_terminology.json'), self)
         self.is_corner_case = False
         self.spawned_actors = []
         self.multiple_bbox_tags_colors = []
         self.client = None
         self.world = None
+        self.simulation_thread = None
+        self.simulation_worker = None
+        self.postprocessing_thread = None
+        self.postprocessing_worker = None
+        self.pending_result = None
+        self.pending_error = None
+        self.close_pending = False
+        self.stop_requested = False
         self.init_ui()
         self.timer = QTimer()
         self.K = build_projection_matrix(self.sensor_width, self.sensor_height, 90)
+        self.simulation_finished.connect(self._capture_succeeded)
+        self.simulation_failed.connect(self._capture_failed)
+        self.postprocessing_failed.connect(self.on_postprocessing_failed)
 
         # Initialize the CARLA client and world
         # self.init_carla_client()
@@ -288,6 +254,9 @@ class MainWindow(QMainWindow):
         i = 0
         self.client = check_carla_server()
         if self.client is None:
+            if not carla_path:
+                print("CARLA is not running and CARLA_ROOT/config.ini path is not configured")
+                return
             print("Starting Carla Server")
             t = threading.Thread(target=launch_carla_server)
             t.start()
@@ -410,7 +379,7 @@ class MainWindow(QMainWindow):
         progress_layout = QVBoxLayout()  # Create a vertical layout
         # create a horizontal layout for the textbox and button
         h_box = QHBoxLayout()
-        self.rec_btn = QPushButton(QIcon("icons/ON.png"), "")
+        self.rec_btn = QPushButton(QIcon(str(REPO_ROOT / "icons/ON.png")), "")
         self.rec_btn.setFixedSize(225, 100)  # set button size to 50x50 pixels
         self.rec_btn.setIconSize(self.rec_btn.size())
         self.rec_btn.setStyleSheet("QPushButton { border: none; }")
@@ -421,17 +390,17 @@ class MainWindow(QMainWindow):
         recoring_layout.addWidget(self.rec_btn)
 
         self.rec_btn.clicked.connect(self.record_scenario)
-        self.play_btn = QPushButton(QIcon("icons/play.png"), "")
+        self.play_btn = QPushButton(QIcon(str(REPO_ROOT / "icons/play.png")), "")
         self.play_btn.setFixedSize(100, 100)  # set button size to 50x50 pixels
         self.play_btn.setIconSize(self.play_btn.size())
         self.play_btn.setStyleSheet("QPushButton { border: none; }")
         self.play_btn.clicked.connect(self.start_scenario)
-        self.pause_btn = QPushButton(QIcon("icons/pause.png"), "")
+        self.pause_btn = QPushButton(QIcon(str(REPO_ROOT / "icons/pause.png")), "")
         self.pause_btn.setFixedSize(100, 100)  # set button size to 50x50 pixels
         self.pause_btn.setIconSize(self.pause_btn.size())
         self.pause_btn.setStyleSheet("QPushButton { border: none; }")
         self.pause_btn.clicked.connect(self.pause_scenario)
-        self.stop_btn = QPushButton(QIcon("icons/stop.png"), "")
+        self.stop_btn = QPushButton(QIcon(str(REPO_ROOT / "icons/stop.png")), "")
         self.stop_btn.setFixedSize(100, 100)  # set button size to 50x50 pixels
         self.stop_btn.setIconSize(self.stop_btn.size())
         self.stop_btn.setStyleSheet("QPushButton { border: none; }")
@@ -466,8 +435,8 @@ class MainWindow(QMainWindow):
         h_box.addWidget(self.folder_button)
         output_layout.addWidget(self.output_label)
         output_layout.addLayout(h_box)
-        timeline_btn = QPushButton(QIcon("icons/timeline.png"), "")
-        new_event_btn = QPushButton(QIcon("icons/new_event.png"), "")
+        timeline_btn = QPushButton(QIcon(str(REPO_ROOT / "icons/timeline.png")), "")
+        new_event_btn = QPushButton(QIcon(str(REPO_ROOT / "icons/new_event.png")), "")
         palette_layout = QHBoxLayout()
         recording_widget.setLayout(recoring_layout)
         # addWidget(self.rec_btn)
@@ -500,73 +469,154 @@ class MainWindow(QMainWindow):
         print(self.scenario_folder)
 
     def start_scenario(self):
+        if self.simulation_thread is not None and self.simulation_thread.isRunning():
+            if self.simulation_worker.pause_event.is_set():
+                self.simulation_worker.resume()
+                self.is_running = True
+                self.start_action.setEnabled(False)
+                self.pause_action.setEnabled(True)
+                self.start_action.setText('Start')
+                return
+            QMessageBox.warning(self, "Simulation already running", "Stop the current simulation before starting another.")
+            return
         self.pause_action.setEnabled(True)
         self.stop_action.setEnabled(True)
         self.start_action.setEnabled(False)
         self.folder_button.setEnabled(False)
         self.init_carla_client()
+        if self.world is None:
+            self.on_simulation_failed("Could not connect to the CARLA server.")
+            return
         self.is_running = True
         self.timer = self.startTimer(100)
-        
-        self.simulation_thread = SimulationThread(
-            self.label_rgb, self.label_seg, self.label_bounding, self.scenario_length, self.progress_bar
-        )
+        scenario_file = None
+        if self.is_corner_case:
+            scenario_file = str(PYTHON_DIR / f"{self.selected_example}.yaml")
+            if not os.path.isfile(scenario_file):
+                self.on_simulation_failed(f"Scenario file does not exist: {scenario_file}")
+                return
+        self.pending_result = None
+        self.pending_error = None
+        self.stop_requested = False
+        self.simulation_thread = QThread(self)
+        self.simulation_worker = SimulationWorker(
+            length=self.scenario_length, output_dir=self.scenario_folder, seed=0,
+            scenario_path=scenario_file)
+        self.simulation_worker.moveToThread(self.simulation_thread)
+        self.simulation_thread.started.connect(self.simulation_worker.run)
+        self.simulation_worker.preview_ready.connect(self.on_preview_ready, Qt.QueuedConnection)
+        self.simulation_worker.progress_changed.connect(self.progress_bar.setValue, Qt.QueuedConnection)
+        self.simulation_worker.succeeded.connect(self._capture_succeeded, Qt.QueuedConnection)
+        self.simulation_worker.failed.connect(self._capture_failed, Qt.QueuedConnection)
+        self.simulation_worker.succeeded.connect(self.simulation_thread.quit)
+        self.simulation_worker.failed.connect(self.simulation_thread.quit)
+        self.simulation_worker.succeeded.connect(self.simulation_worker.deleteLater)
+        self.simulation_worker.failed.connect(self.simulation_worker.deleteLater)
+        self.simulation_thread.finished.connect(self._simulation_thread_finished)
         self.simulation_thread.start()
 
-        # Connect signals to slots for updating labels
-        self.update_rgb_label.connect(self.update_rgb_label_slot)
-        self.update_semantic_label.connect(self.update_semantic_label_slot)
-        self.update_instance_label.connect(self.update_instance_label_slot)
-
-    def update_rgb_label_slot(self, image):
-        # Update the RGB label with the provided image
-        self.label_rgb.setPixmap(QPixmap.fromImage(image))
-
-    def update_semantic_label_slot(self, image):
-        # Update the semantic label with the provided image
-        self.label_seg.setPixmap(QPixmap.fromImage(image))
-
-    def update_instance_label_slot(self, image):
-        # Update the instance label with the provided image
-        self.label_bounding.setPixmap(QPixmap.fromImage(image))
-
-        #run_carla_simulation(rgb_label=self.label_rgb, semantic_label=self.label_seg, instance_label=self.label_bounding, register=True, image_width=600, image_height=400)
-        # if self.is_corner_case:
-        #    self.execute_cornercase_scenario()
-        # else:
-        # Create a stop event
-        #    stop_event = threading.Event()
-        # Create a new thread
-        #    thread = threading.Thread(target=self.run_script, args=(stop_event,))
-
-        # Start the thread
-        # thread.start()
-        #settings = self.world.get_settings()
-        #settings.synchronous_mode = True
-        #settings.fixed_delta_seconds = 0.1
-        #self.spawn_vehicle_and_cameras()
-        #self.world.apply_settings(settings)
-        # self.progress_updated.connect(self.update_progress)
+    @pyqtSlot(object)
+    def on_preview_ready(self, frame):
+        """Construct Qt painting objects only on the GUI thread."""
+        if not isinstance(frame, PreviewFrame):
+            return
+        image = QImage(frame.raw_data, frame.width, frame.height,
+                       frame.width * 4, QImage.Format_ARGB32).copy()
+        pixmap = QPixmap.fromImage(image.scaled(600, 300, Qt.KeepAspectRatio))
+        labels = {"rgb": self.label_rgb, "semantic_segmentation": self.label_seg,
+                  "instance_segmentation": self.label_bounding}
+        labels[frame.sensor_name].setPixmap(pixmap)
 
     def stop_scenario(self):
         self.pause_action.setEnabled(False)
         self.stop_action.setEnabled(False)
-        self.start_action.setEnabled(True)
+        self.start_action.setEnabled(False)
+        self.progress_label.setText("Stopping simulation and restoring CARLA settings…")
+        self.stop_requested = True
+        if self.simulation_worker is not None:
+            self.simulation_worker.stop()
+
+    @pyqtSlot(dict)
+    def _capture_succeeded(self, result):
+        self.pending_result = result
+
+    @pyqtSlot(str)
+    def _capture_failed(self, message):
+        self.pending_error = message
+
+    @pyqtSlot()
+    def _simulation_thread_finished(self):
+        result, error = self.pending_result, self.pending_error
         self.is_running = False
-        settings = self.world.get_settings()
-        settings.synchronous_mode = False
-        self.world.apply_settings(settings)
-        # settings=self.world.get_settings()
-        # settings.synchronous_mode = False
-        # self.world.apply_settings(settings)
-        self.killTimer(self.timer)
-        write_data_to_disk()
-        self.generate_Scenario_name()
+        self.start_action.setEnabled(True)
+        self.stop_action.setEnabled(False)
+        self.pause_action.setEnabled(False)
+        self.folder_button.setEnabled(True)
         self.start_action.setText('Start')
-        self.scenario_tick = 0
-        for _, actor in self.spawned_actors:
-            actor.destroy()
+        if self.timer:
+            self.killTimer(self.timer)
+            self.timer = None
         self.client = None
+        self.world = None
+        self.simulation_worker = None
+        self.simulation_thread = None
+        if error:
+            self.progress_label.setText("Simulation failed")
+            QMessageBox.critical(self, "CARLA simulation failed", error)
+        elif result and result.get("stopped"):
+            self.progress_label.setText(
+                f"Cancelled after {len(result['captured_frames'])} synchronized frames; post-processing skipped")
+        elif result:
+            self.progress_label.setText(f"Captured {len(result['captured_frames'])} synchronized frames")
+            self._start_postprocessing(result['output_dir'])
+        self.scenario_tick = 0
+        self.spawned_actors.clear()
+        self.generate_Scenario_name()
+        if self.close_pending:
+            QTimer.singleShot(0, self.close)
+
+    def _start_postprocessing(self, output_dir):
+        self.postprocessing_thread = QThread(self)
+        self.postprocessing_worker = PostProcessingWorker(
+            output_dir, str(PYTHON_DIR / 'environment_object.json'))
+        self.postprocessing_worker.moveToThread(self.postprocessing_thread)
+        self.postprocessing_thread.started.connect(self.postprocessing_worker.run)
+        self.postprocessing_worker.succeeded.connect(self.postprocessing_thread.quit)
+        self.postprocessing_worker.failed.connect(self.on_postprocessing_failed, Qt.QueuedConnection)
+        self.postprocessing_worker.failed.connect(self.postprocessing_thread.quit)
+        self.postprocessing_worker.succeeded.connect(self.postprocessing_worker.deleteLater)
+        self.postprocessing_worker.failed.connect(self.postprocessing_worker.deleteLater)
+        self.postprocessing_thread.finished.connect(self._postprocessing_finished)
+        self.postprocessing_thread.start()
+
+    def _postprocessing_finished(self):
+        self.postprocessing_worker = None
+        self.postprocessing_thread = None
+        if self.close_pending:
+            QTimer.singleShot(0, self.close)
+
+    def on_simulation_failed(self, message):
+        self.is_running = False
+        self.start_action.setEnabled(True)
+        self.stop_action.setEnabled(False)
+        self.pause_action.setEnabled(False)
+        self.folder_button.setEnabled(True)
+        QMessageBox.critical(self, "CARLA simulation failed", message)
+
+    def on_postprocessing_failed(self, message):
+        QMessageBox.critical(self, "Dataset post-processing failed", message)
+
+    def closeEvent(self, event):
+        if self.simulation_thread is not None and self.simulation_thread.isRunning():
+            self.close_pending = True
+            self.stop_scenario()
+            event.ignore()
+            return
+        if self.postprocessing_thread is not None and self.postprocessing_thread.isRunning():
+            self.close_pending = True
+            event.ignore()
+            return
+        event.accept()
 
     def pause_scenario(self):
         self.pause_action.setEnabled(False)
@@ -574,14 +624,16 @@ class MainWindow(QMainWindow):
         self.start_action.setEnabled(True)
         self.start_action.setText('Resume')
         self.is_running = False
+        if self.simulation_worker is not None:
+            self.simulation_worker.pause()
 
     def record_scenario(self):
         if self.record_action.text() == 'Record':
             self.record_action.setText('Stop recording')
-            self.rec_btn.setIcon(QIcon("icons/ON.png"))
+            self.rec_btn.setIcon(QIcon(str(REPO_ROOT / "icons/ON.png")))
         else:
             self.record_action.setText('Record')
-            self.rec_btn.setIcon(QIcon("icons/OFF.png"))
+            self.rec_btn.setIcon(QIcon(str(REPO_ROOT / "icons/OFF.png")))
         self.is_recording = not self.is_recording
 
     def show_cornercase_form(self):
@@ -709,16 +761,19 @@ class MainWindow(QMainWindow):
         self.data = []
 
 
-if __name__ == '__main__':
+def main():
     main_window = None
     try:
         app = QApplication(sys.argv)
-        # sys.stdout = ConsoleLogger()
-        # sys.stderr = ConsoleLogger()
         main_window = MainWindow()
         main_window.show()
-        sys.exit(app.exec())
+        return app.exec()
     except Exception as e:
-        c = main_window.client
-        check_connection_status(c)
-        print("Connection failed:", e)
+        if main_window is not None and main_window.client is not None:
+            check_connection_status(main_window.client)
+        print("CornerSim startup failed:", e, file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
